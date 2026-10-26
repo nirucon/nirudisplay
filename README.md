@@ -9,16 +9,29 @@ no xrandr parser and no rollback daemon.
 
 ## What it does
 
-- Drag screens to move them, with edge snapping, or use the keyboard and exact
-  coordinate fields.
-- Enable or disable connected outputs, choose the primary screen, resolution,
-  refresh rate and rotation. Available EDID manufacturer/model/serial details
-  are shown with the connector name when the EDID exposes them.
-- Identify every active screen with a number.
-- Save, load, rename, update and delete profiles in
-  `~/.config/niruwm/displays.toml`.
+- Drag screens to move them. A frozen canvas, a dead zone and pixel-based edge
+  snapping keep the screen under the pointer while dragging. The exact position
+  is shown next to the screen and snap guides show shared edges. Arrow keys move
+  the selected screen by 1 px, or 10 px with Shift.
+- Every screen has a stable number, a full frame and a distinct fill. The number
+  is the same in the canvas, the screen list and Identify. Connector, EDID
+  manufacturer/model and a serial suffix make identical monitors distinguishable.
+- A selected screen has its own ring; the primary screen has a separate `P`
+  badge. Disabled outputs stay visible with a dashed frame. Partial overlaps and
+  invalid layouts are drawn in the warning colour and block Preview until fixed.
+- Enable or disable outputs, choose the primary screen, resolution, refresh rate
+  and rotation, or use the Single, Extend and Mirror layout actions. Mirroring
+  moves and edits the mirrored screens as one group.
+- Identify every active screen with its number, connector and model for four
+  seconds. Mirrored outputs are listed together on the physical screen.
+- Save, load, rename, update and delete profiles. Delete asks for confirmation.
+  Screens and profiles are paged with the `<`/`>` buttons or the mouse wheel, so
+  every entry stays reachable.
+- Zoom with the mouse wheel over the canvas, pan with the middle mouse button,
+  and press `0` to fit the layout again.
 - Preview a layout for 15 seconds, keep it or revert. A separate watchdog keeps
-  the countdown working even if the window is closed or crashes.
+  the countdown working even if the window is closed or crashes. A preview token
+  is adopted again when the window is reopened, so Keep and Revert keep working.
 - Opt in to a profile at the next login; nothing is applied automatically by
   default.
 
@@ -35,17 +48,19 @@ nirudisplay list         # saved profiles
 nirudisplay --version | --help
 ```
 
-Keyboard: `Tab` moves focus, arrows move the selected screen (`Shift` for 10 px),
-`Space`/`Enter` activates the focused control, `I` identifies screens, `R`
-reloads, `F1` shows help and `Esc`/`Q` closes.
+Keyboard: `Tab` moves focus, arrows move the selected screen (`Shift` for 10 px)
+when no property control is focused, `Space`/`Enter` activates the focused
+control, `I` identifies screens, `R` reloads, `Ctrl+Z` undoes a draft change, `0` fits the canvas,
+`F1` shows help and `Esc`/`Q` closes. With a mode or rate button focused,
+left/right change that property.
 
 ## Preview and profiles
 
 `Preview` applies the draft with a visible countdown. `Keep` confirms it;
 `Revert` or the timeout restores the previous layout. The timeout runs in a
 separate `niructl` process, so closing the window does not leave a risky layout
-in place. Profile files keep older entries without a refresh rate working;
-new saves record the rate that was actually applied.
+in place. If the preview expires while the draft has unsaved changes, the draft
+is kept and the status line says so. Closing with unsaved changes asks first.
 
 `Use at login` stores an opt-in startup profile. `niruwm-session` applies it once
 before the window manager starts. If a saved output is missing, the session logs

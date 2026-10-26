@@ -35,6 +35,42 @@ impl Palette {
         let lift = |v: u32| (v + 10).min(255);
         (lift(r) << 16) | (lift(g) << 8) | lift(b)
     }
+
+    /// Linear blend between two X11 pixels. `amount` is how much of `to` is used.
+    pub fn blend(from: u32, to: u32, amount: f32) -> u32 {
+        let amount = amount.clamp(0.0, 1.0);
+        let channel = |shift: u32| {
+            let a = (from >> shift) & 0xff;
+            let b = (to >> shift) & 0xff;
+            (f32::from(a as u8) * (1.0 - amount) + f32::from(b as u8) * amount)
+                .round()
+                .clamp(0.0, 255.0) as u32
+        };
+        (channel(16) << 16) | (channel(8) << 8) | channel(0)
+    }
+
+    /// The screen area, deliberately lighter than the canvas behind it.
+    pub fn screen(&self) -> u32 {
+        Self::blend(self.background, self.foreground, 0.075)
+    }
+
+    /// A selected screen, still distinct from the canvas and the frame.
+    pub fn screen_selected(&self) -> u32 {
+        Self::blend(self.screen(), self.accent, 0.22)
+    }
+
+    /// A visible frame for every screen, not just the selected one.
+    pub fn frame(&self) -> u32 {
+        Self::blend(self.border, self.muted, 0.45)
+    }
+
+    pub fn error(&self) -> u32 {
+        Self::blend(self.background, 0xe35c5c, 0.82)
+    }
+
+    pub fn warning(&self) -> u32 {
+        Self::blend(self.background, 0xe0b050, 0.80)
+    }
 }
 
 impl Palette {
@@ -166,6 +202,16 @@ pub fn load() -> Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screens_and_semantic_colours_are_distinct() {
+        let palette = Palette::fallback();
+        assert_ne!(palette.screen(), palette.background);
+        assert_ne!(palette.screen_selected(), palette.screen());
+        assert_ne!(palette.error(), palette.background);
+        assert_ne!(palette.warning(), palette.error());
+        assert_ne!(palette.frame(), palette.background);
+    }
 
     #[test]
     fn a_colour_is_read_from_a_theme_file() {
