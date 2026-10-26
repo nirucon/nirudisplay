@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NIRU Display
+Comment=Arrange screens, choose modes and refresh rates, save layouts
+Keywords=Display;Monitor;Screen;Resolution;Refresh;Profile;Layout;
+Exec=nirudisplay
+Icon=nirudisplay
+Terminal=false
+Categories=Settings;DesktopSettings;Qt;
+StartupNotify=false
