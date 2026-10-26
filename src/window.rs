@@ -56,6 +56,7 @@ pub enum Hit {
     RatePrev,
     RateNext,
     Identify,
+    Mirror,
     Apply,
     Keep,
     Revert,
@@ -256,6 +257,32 @@ impl State {
             .into();
             self.set_dirty();
         }
+    }
+
+    pub fn mirror_screens(&mut self) {
+        let Some(source) = self.current().cloned() else {
+            return;
+        };
+        if self.draft.iter().filter(|output| output.enabled).count() < 2 {
+            self.set_message("Enable at least two screens to mirror them.", true);
+            return;
+        }
+        for output in &mut self.draft {
+            if !output.enabled {
+                continue;
+            }
+            output.mode = source.mode.clone();
+            output.rate = source.rate;
+            output.rotation = source.rotation.clone();
+            output.x = 0;
+            output.y = 0;
+            output.primary = output.name == source.name;
+        }
+        self.set_dirty();
+        self.set_message(
+            "Mirroring the selected screen on every enabled output. Preview to confirm.",
+            false,
+        );
     }
 
     fn mode_index(&self) -> Option<usize> {
@@ -774,10 +801,11 @@ fn hit(state: &State, l: Layout, canvas: Canvas, x: i16, y: i16) -> Option<Hit> 
         (4, Hit::RatePrev),
         (4, Hit::RateNext),
         (5, Hit::Identify),
+        (5, Hit::Mirror),
     ] {
-        let rect = if matches!(hit, Hit::ModeNext | Hit::RateNext) {
+        let rect = if matches!(hit, Hit::ModeNext | Hit::RateNext | Hit::Mirror) {
             pair_button(l, slot, true)
-        } else if matches!(hit, Hit::ModePrev | Hit::RatePrev) {
+        } else if matches!(hit, Hit::ModePrev | Hit::RatePrev | Hit::Identify) {
             pair_button(l, slot, false)
         } else {
             panel_button(l, slot)
@@ -1478,7 +1506,8 @@ impl App {
             self.palette.muted,
             11.0,
         )?;
-        self.button(panel_button(l, 5), "Identify screens", false, enabled)?;
+        self.button(pair_button(l, 5, false), "Identify", false, enabled)?;
+        self.button(pair_button(l, 5, true), "Mirror", false, enabled)?;
         let buttons = apply_buttons(l);
         self.button(buttons[0], "Preview", !state.preview_active(), enabled)?;
         self.button(
@@ -1670,7 +1699,8 @@ fn focus_rect(state: &State, l: Layout, canvas: Canvas, focus: Hit) -> Option<Re
         Hit::ModeNext => Some(pair_button(l, 3, true)),
         Hit::RatePrev => Some(pair_button(l, 4, false)),
         Hit::RateNext => Some(pair_button(l, 4, true)),
-        Hit::Identify => Some(panel_button(l, 5)),
+        Hit::Identify => Some(pair_button(l, 5, false)),
+        Hit::Mirror => Some(pair_button(l, 5, true)),
         Hit::Apply => Some(apply_buttons(l)[0]),
         Hit::Keep => Some(apply_buttons(l)[1]),
         Hit::Revert => Some(apply_buttons(l)[2]),
@@ -1930,6 +1960,7 @@ fn focus_order(state: &State) -> Vec<Hit> {
         Hit::RatePrev,
         Hit::RateNext,
         Hit::Identify,
+        Hit::Mirror,
         Hit::Apply,
         Hit::Keep,
         Hit::Revert,
@@ -1970,6 +2001,7 @@ fn activate(app: &mut App, state: &mut State, action: Hit) -> Result<(), String>
             app.identify(state)?;
             state.identify_until = app.identify_until;
         }
+        Hit::Mirror => state.mirror_screens(),
         Hit::Apply => {
             if let Err(err) = state.apply_preview() {
                 state.set_message(err, true);
