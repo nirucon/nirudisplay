@@ -251,6 +251,13 @@ pub fn preview(profile: &Profile, seconds: u64) -> Result<(), String> {
 
 static PREVIEW_TOKEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Adopt the token of a preview that was started by another window or the CLI.
+pub fn adopt_preview(preview: Option<&Preview>) {
+    if let Ok(mut token) = PREVIEW_TOKEN.lock() {
+        *token = preview.map(|preview| preview.token.clone());
+    }
+}
+
 fn finish_preview(action: &str) -> Result<(), String> {
     let mut token = PREVIEW_TOKEN
         .lock()
