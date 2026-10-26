@@ -935,7 +935,7 @@ impl App {
                 ),
         )
         .map_err(|e| e.to_string())?;
-        c.create_gc(gc, win, &CreateGCAux::new())
+        c.create_gc(gc, win, &CreateGCAux::new().graphics_exposures(0))
             .map_err(|e| e.to_string())?;
         c.create_pixmap(depth, back, root, WIDTH, HEIGHT)
             .map_err(|e| e.to_string())?;
@@ -1714,7 +1714,9 @@ pub fn run(app: &mut App, state: &mut State) -> Result<(), String> {
         let mut handled = false;
         while let Some(event) = app.c.poll_for_event().map_err(|e| e.to_string())? {
             handled = true;
-            dirty = true;
+            if !matches!(event, Event::NoExposure(_)) {
+                dirty = true;
+            }
             match event {
                 Event::Expose(e) if e.count != 0 => {}
                 Event::ConfigureNotify(e) => {
@@ -1906,12 +1908,6 @@ pub fn run(app: &mut App, state: &mut State) -> Result<(), String> {
         }
         if !handled {
             wait_for_input(app)?;
-        }
-        if state.name_mode.is_none() && state.identify_until.is_none() && !help {
-            // Redraw after an external refresh even without a user event.
-            if last_refresh.elapsed() < Duration::from_millis(50) {
-                dirty = true;
-            }
         }
     }
     if state.preview_active() {
