@@ -238,15 +238,37 @@ pub fn read_status() -> Result<Status, String> {
 
 pub fn preview(profile: &Profile, seconds: u64) -> Result<(), String> {
     let text = serde_json::to_string(profile).map_err(|e| e.to_string())?;
-    run_stdin(&["display", "preview-json", &seconds.to_string()], &text).map(|_| ())
+    let output = run_stdin(&["display", "preview-json", &seconds.to_string()], &text)?;
+    let token = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("preview-token: ").map(str::to_owned))
+        .ok_or("backend did not return a display transaction token")?;
+    *PREVIEW_TOKEN
+        .lock()
+        .map_err(|_| "display transaction unavailable")? = Some(token);
+    Ok(())
+}
+
+static PREVIEW_TOKEN: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn finish_preview(action: &str) -> Result<(), String> {
+    let mut token = PREVIEW_TOKEN
+        .lock()
+        .map_err(|_| "display transaction unavailable")?;
+    let identity = token
+        .as_deref()
+        .ok_or("this window has no display preview to confirm")?;
+    run(&["display", action, identity])?;
+    *token = None;
+    Ok(())
 }
 
 pub fn keep() -> Result<(), String> {
-    run(&["display", "keep"]).map(|_| ())
+    finish_preview("keep")
 }
 
 pub fn revert() -> Result<(), String> {
-    run(&["display", "revert"]).map(|_| ())
+    finish_preview("revert")
 }
 
 pub fn save_profile(profile: &Profile, name: &str) -> Result<(), String> {
