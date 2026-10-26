@@ -1506,6 +1506,24 @@ impl App {
             self.palette.muted,
             11.0,
         )?;
+        if let Some(identity) = selected
+            .and_then(|output| state.status.output(&output.name))
+            .and_then(|output| output.identity.as_ref())
+        {
+            let model = identity
+                .model
+                .as_deref()
+                .map(|model| format!(" {model}"))
+                .unwrap_or_default();
+            let text = format!("Monitor: {}{}", identity.manufacturer, model);
+            self.label(
+                l.panel.x + 10,
+                l.panel.y + 432,
+                &truncate(&text, 44),
+                self.palette.muted,
+                10.0,
+            )?;
+        }
         self.button(pair_button(l, 5, false), "Identify", false, enabled)?;
         self.button(pair_button(l, 5, true), "Mirror", false, enabled)?;
         let buttons = apply_buttons(l);

@@ -12,7 +12,8 @@ no xrandr parser and no rollback daemon.
 - Drag screens to move them, with edge snapping, or use the keyboard and exact
   coordinate fields.
 - Enable or disable connected outputs, choose the primary screen, resolution,
-  refresh rate and rotation.
+  refresh rate and rotation. Available EDID manufacturer/model/serial details
+  are shown with the connector name when the EDID exposes them.
 - Identify every active screen with a number.
 - Save, load, rename, update and delete profiles in
   `~/.config/niruwm/displays.toml`.

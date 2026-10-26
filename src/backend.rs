@@ -50,9 +50,23 @@ pub struct DisplayMode {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Identity {
+    #[serde(default)]
+    pub manufacturer: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub serial: Option<String>,
+    #[serde(default)]
+    pub product_code: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct OutputState {
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub identity: Option<Identity>,
     #[serde(default)]
     pub connected: bool,
     #[serde(default)]
@@ -263,12 +277,32 @@ pub fn status_text() -> Result<String, String> {
             continue;
         }
         let current = output.current.as_ref();
+        let identity = output
+            .identity
+            .as_ref()
+            .map(|identity| {
+                format!(
+                    "{}{}",
+                    identity.manufacturer,
+                    identity
+                        .model
+                        .as_deref()
+                        .map(|model| format!(" {model}"))
+                        .unwrap_or_default()
+                )
+            })
+            .unwrap_or_default();
         text.push_str(&format!(
-            "{}\tconnected={}\tactive={}\tprimary={}\t{}\n",
+            "{}\tconnected={}\tactive={}\tprimary={}\t{}{}\n",
             output.name,
             output.connected,
             output.active,
             current.map(|current| current.primary).unwrap_or(false),
+            if identity.is_empty() {
+                String::new()
+            } else {
+                format!("{identity}\t")
+            },
             current
                 .map(|current| format!(
                     "{}@{}{}",
@@ -314,7 +348,7 @@ mod tests {
     const SAMPLE: &str = r#"{
       "schema": 1,
       "outputs": [{
-        "name": "eDP-1", "connected": true, "active": true, "primary": true,
+        "name": "eDP-1", "identity": {"manufacturer":"DEL","model":"Test Panel","serial":"123","product_code":4660}, "connected": true, "active": true, "primary": true,
         "geometry": {"x":0,"y":0,"width":1920,"height":1080},
         "current": {"mode":"1920x1080","rate":60.0,"position":"0x0","rotation":"normal","primary":true},
         "modes": [{"mode":"1920x1080","rates":[60.0,59.94],"preferred":true}]
@@ -329,6 +363,15 @@ mod tests {
         let status: Status = serde_json::from_str(SAMPLE).unwrap();
         assert_eq!(status.schema, 1);
         assert_eq!(status.outputs[0].name, "eDP-1");
+        assert_eq!(
+            status.outputs[0]
+                .identity
+                .as_ref()
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("Test Panel")
+        );
         assert_eq!(status.outputs[0].geometry.as_ref().unwrap().width, 1920);
         assert_eq!(status.outputs[0].current.as_ref().unwrap().rate, Some(60.0));
         assert_eq!(status.profiles[0].name, "Laptop");
