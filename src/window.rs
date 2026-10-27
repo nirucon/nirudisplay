@@ -262,6 +262,11 @@ impl State {
             .unwrap_or(false)
     }
 
+    fn refresh_dirty_from_status(&mut self) {
+        let actual = draft_from_status(&self.status);
+        self.dirty = !layouts_match(&self.draft, &actual);
+    }
+
     pub fn reload(&mut self, force_draft: bool) -> Result<(), String> {
         let status = backend::read_status()?;
         backend::adopt_preview(status.preview.as_ref());
@@ -305,6 +310,18 @@ impl State {
         }
         self.status = status;
         self.clamp_scrolls();
+        Ok(())
+    }
+
+    /// Refresh profile/startup metadata without replacing an edited draft.
+    pub fn refresh_profiles(&mut self) -> Result<(), String> {
+        let status = backend::read_status()?;
+        backend::adopt_preview(status.preview.as_ref());
+        self.status = status;
+        self.clamp_scrolls();
+        if self.selected >= self.draft.len() {
+            self.selected = self.draft.len().saturating_sub(1);
+        }
         Ok(())
     }
 
@@ -465,6 +482,67 @@ impl State {
         self.dirty = true;
     }
 
+    fn common_modes_for_group(&self, group: &[usize]) -> Vec<backend::DisplayMode> {
+        let mut states = group
+            .iter()
+            .filter_map(|index| self.draft.get(*index))
+            .filter_map(|output| self.status.output(&output.name));
+        let Some(first) = states.next() else {
+            return Vec::new();
+        };
+        let others: Vec<&backend::OutputState> = states.collect();
+        first
+            .modes
+            .iter()
+            .filter_map(|mode| {
+                let mut rates = mode.rates.clone();
+                for other in &others {
+                    let candidate = other
+                        .modes
+                        .iter()
+                        .find(|candidate| candidate.mode == mode.mode)?;
+                    rates.retain(|rate| {
+                        candidate
+                            .rates
+                            .iter()
+                            .any(|candidate| (candidate - rate).abs() < 0.01)
+                    });
+                }
+                Some(backend::DisplayMode {
+                    mode: mode.mode.clone(),
+                    rates,
+                    preferred: mode.preferred,
+                })
+            })
+            .collect()
+    }
+
+    fn common_rates_for_group(&self, group: &[usize], mode_name: &str) -> Vec<f64> {
+        let mut states = group
+            .iter()
+            .filter_map(|index| self.draft.get(*index))
+            .filter_map(|output| self.status.output(&output.name));
+        let Some(first) = states.next() else {
+            return Vec::new();
+        };
+        let Some(first_mode) = first.modes.iter().find(|mode| mode.mode == mode_name) else {
+            return Vec::new();
+        };
+        let mut rates = first_mode.rates.clone();
+        for other in states {
+            let Some(candidate) = other.modes.iter().find(|mode| mode.mode == mode_name) else {
+                return Vec::new();
+            };
+            rates.retain(|rate| {
+                candidate
+                    .rates
+                    .iter()
+                    .any(|candidate| (candidate - rate).abs() < 0.01)
+            });
+        }
+        rates
+    }
+
     pub fn mirror_screens(&mut self) {
         let Some(source) = self.current().cloned() else {
             return;
@@ -477,13 +555,41 @@ impl State {
             self.set_message("Enable at least two screens to mirror them.", true);
             return;
         }
+        let group: Vec<usize> = self
+            .draft
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| output.enabled)
+            .map(|(index, _)| index)
+            .collect();
+        let common = self.common_modes_for_group(&group);
+        let Some(mode) = common
+            .iter()
+            .find(|mode| mode.mode == source.mode)
+            .or_else(|| common.iter().find(|mode| mode.preferred))
+            .or_else(|| common.first())
+        else {
+            self.set_message(
+                "The enabled screens have no common resolution; mirroring was not changed.",
+                true,
+            );
+            return;
+        };
+        let rate = source
+            .rate
+            .filter(|rate| {
+                mode.rates
+                    .iter()
+                    .any(|candidate| (candidate - rate).abs() < 0.01)
+            })
+            .or_else(|| mode.rates.first().copied());
         self.checkpoint();
         for output in &mut self.draft {
             if !output.enabled {
                 continue;
             }
-            output.mode = source.mode.clone();
-            output.rate = source.rate;
+            output.mode = mode.mode.clone();
+            output.rate = rate;
             output.rotation = source.rotation.clone();
             output.x = source.x;
             output.y = source.y;
@@ -535,12 +641,6 @@ impl State {
         self.set_message("The screens are extended side by side.", false);
     }
 
-    fn mode_index(&self) -> Option<usize> {
-        let output = self.current()?;
-        let state = self.status.output(&output.name)?;
-        state.modes.iter().position(|mode| mode.mode == output.mode)
-    }
-
     pub fn cycle_mode(&mut self, delta: i32) {
         let Some(output) = self.current().cloned() else {
             return;
@@ -549,28 +649,37 @@ impl State {
             self.set_message("Enable the screen before choosing a mode.", true);
             return;
         }
-        let next = self.status.output(&output.name).and_then(|screen| {
-            if screen.modes.is_empty() {
-                return None;
-            }
-            let index = self.mode_index().unwrap_or(0);
-            let next = (index as i32 + delta).rem_euclid(screen.modes.len() as i32) as usize;
-            let mode = screen.modes.get(next)?;
-            let rate = output
-                .rate
-                .filter(|rate| {
-                    mode.rates
-                        .iter()
-                        .any(|candidate| (candidate - rate).abs() < 0.01)
-                })
-                .or_else(|| mode.rates.first().copied());
-            Some((mode.mode.clone(), rate))
-        });
-        let Some((mode, rate)) = next else {
-            self.set_message("No available modes for this screen.", true);
-            return;
-        };
         let group = self.mirror_group(self.selected);
+        let modes = if group.len() > 1 {
+            self.common_modes_for_group(&group)
+        } else {
+            self.status
+                .output(&output.name)
+                .map(|screen| screen.modes.clone())
+                .unwrap_or_default()
+        };
+        if modes.is_empty() {
+            self.set_message(
+                "No modes are available on every screen in this mirror group.",
+                true,
+            );
+            return;
+        }
+        let index = modes
+            .iter()
+            .position(|mode| mode.mode == output.mode)
+            .unwrap_or(0);
+        let next = (index as i32 + delta).rem_euclid(modes.len() as i32) as usize;
+        let mode = &modes[next];
+        let rate = output
+            .rate
+            .filter(|rate| {
+                mode.rates
+                    .iter()
+                    .any(|candidate| (candidate - rate).abs() < 0.01)
+            })
+            .or_else(|| mode.rates.first().copied());
+        let (mode, rate) = (mode.mode.clone(), rate);
         self.checkpoint();
         for index in group {
             if let Some(output) = self.draft.get_mut(index) {
@@ -589,27 +698,40 @@ impl State {
             self.set_message("Enable the screen before choosing a refresh rate.", true);
             return;
         }
-        let next = self.status.output(&output.name).and_then(|state| {
-            let mode = state.modes.iter().find(|mode| mode.mode == output.mode)?;
-            if mode.rates.is_empty() {
-                return None;
-            }
-            let index = output
-                .rate
-                .and_then(|rate| {
-                    mode.rates
+        let group = self.mirror_group(self.selected);
+        let rates = if group.len() > 1 {
+            self.common_rates_for_group(&group, &output.mode)
+        } else {
+            self.status
+                .output(&output.name)
+                .and_then(|state| {
+                    state
+                        .modes
                         .iter()
-                        .position(|candidate| (candidate - rate).abs() < 0.01)
+                        .find(|mode| mode.mode == output.mode)
+                        .map(|mode| mode.rates.clone())
                 })
-                .unwrap_or(0) as i32;
-            let next = (index + delta).rem_euclid(mode.rates.len() as i32) as usize;
-            mode.rates.get(next).copied()
-        });
-        let Some(rate) = next else {
-            self.set_message("No available refresh rates for this mode.", true);
+                .unwrap_or_default()
+        };
+        if rates.is_empty() {
+            self.set_message(
+                "No refresh rates are available on every screen in this mirror group.",
+                true,
+            );
+            return;
+        }
+        let index = output
+            .rate
+            .and_then(|rate| {
+                rates
+                    .iter()
+                    .position(|candidate| (candidate - rate).abs() < 0.01)
+            })
+            .unwrap_or(0) as i32;
+        let next = (index + delta).rem_euclid(rates.len() as i32) as usize;
+        let Some(rate) = rates.get(next).copied() else {
             return;
         };
-        let group = self.mirror_group(self.selected);
         self.checkpoint();
         for index in group {
             if let Some(output) = self.draft.get_mut(index) {
@@ -764,9 +886,9 @@ impl State {
         let mut profile = self.profile_from_draft();
         profile.name = name.trim().to_string();
         backend::save_profile(&profile, name.trim())?;
-        self.dirty = false;
         self.set_message(format!("Saved display profile {}.", name.trim()), false);
-        self.reload(true)?;
+        self.refresh_profiles()?;
+        self.refresh_dirty_from_status();
         self.selected_profile = self
             .status
             .profiles
@@ -789,7 +911,7 @@ impl State {
             .map(|profile| profile.name.clone())
             .ok_or("unknown display profile")?;
         backend::rename_profile(&old, new.trim())?;
-        self.reload(false)?;
+        self.refresh_profiles()?;
         self.selected_profile = self
             .status
             .profiles
@@ -804,7 +926,8 @@ impl State {
 
     pub fn delete_named(&mut self, name: &str) -> Result<(), String> {
         backend::delete_profile(name)?;
-        self.reload(false)?;
+        self.refresh_profiles()?;
+        self.refresh_dirty_from_status();
         self.selected_profile = None;
         self.set_message(format!("Deleted display profile {name}."), false);
         Ok(())
@@ -881,8 +1004,14 @@ fn normalize_draft(draft: &mut [DraftOutput]) -> bool {
     if draft.is_empty() {
         return false;
     }
-    let min_x = draft.iter().map(|output| output.x).min().unwrap_or(0);
-    let min_y = draft.iter().map(|output| output.y).min().unwrap_or(0);
+    let active: Vec<&DraftOutput> = draft.iter().filter(|output| output.enabled).collect();
+    let pool = if active.is_empty() {
+        draft.iter().collect::<Vec<_>>()
+    } else {
+        active
+    };
+    let min_x = pool.iter().map(|output| output.x).min().unwrap_or(0);
+    let min_y = pool.iter().map(|output| output.y).min().unwrap_or(0);
     if min_x == 0 && min_y == 0 {
         return false;
     }
@@ -938,10 +1067,13 @@ fn validate_draft(draft: &[DraftOutput]) -> Vec<Issue> {
         });
         return issues;
     }
-    if enabled.iter().any(|output| output.mode.is_empty()) {
+    if enabled
+        .iter()
+        .any(|output| output.mode.is_empty() || mode_size(&output.mode).is_none())
+    {
         issues.push(Issue {
             blocking: true,
-            text: "A selected screen has no display mode.".into(),
+            text: "A selected screen has no usable display mode.".into(),
         });
     }
     if !enabled.iter().any(|output| output.primary) {
@@ -966,12 +1098,12 @@ fn validate_draft(draft: &[DraftOutput]) -> Vec<Issue> {
             }
         }
     }
-    let max_x = draft
+    let max_x = enabled
         .iter()
         .map(|output| output.x.saturating_add(output.width()))
         .max()
         .unwrap_or(0);
-    let max_y = draft
+    let max_y = enabled
         .iter()
         .map(|output| output.y.saturating_add(output.height()))
         .max()
@@ -982,7 +1114,7 @@ fn validate_draft(draft: &[DraftOutput]) -> Vec<Issue> {
             text: "The desktop would be larger than the X server can address.".into(),
         });
     }
-    if draft.iter().any(|output| output.x < 0 || output.y < 0) {
+    if enabled.iter().any(|output| output.x < 0 || output.y < 0) {
         issues.push(Issue {
             blocking: false,
             text: "The layout is moved to non-negative coordinates when it is applied.".into(),
@@ -4480,6 +4612,80 @@ mod tests {
         assert!(!state.preview_changed());
         state.draft[0].x = 10;
         assert!(state.preview_changed());
+    }
+
+    fn output_state(name: &str, modes: &[(&str, &[f64])]) -> backend::OutputState {
+        backend::OutputState {
+            name: name.into(),
+            connected: true,
+            active: true,
+            modes: modes
+                .iter()
+                .map(|(mode, rates)| backend::DisplayMode {
+                    mode: (*mode).into(),
+                    rates: rates.to_vec(),
+                    preferred: false,
+                })
+                .collect(),
+            ..backend::OutputState::default()
+        }
+    }
+
+    #[test]
+    fn mirroring_uses_a_resolution_and_rate_supported_by_every_screen() {
+        let mut draft = vec![
+            output("a", 0, 0, "2560x1440"),
+            output("b", 0, 0, "2560x1440"),
+        ];
+        draft[0].rate = Some(30.0);
+        draft[0].primary = true;
+        let mut state = state_with(draft);
+        state.status.outputs = vec![
+            output_state("a", &[("2560x1440", &[30.0, 60.0]), ("1920x1080", &[60.0])]),
+            output_state("b", &[("2560x1440", &[60.0]), ("1280x720", &[50.0])]),
+        ];
+        state.mirror_screens();
+        assert_eq!(state.draft[0].mode, "2560x1440");
+        assert_eq!(state.draft[1].mode, "2560x1440");
+        assert_eq!(state.draft[0].rate, Some(60.0));
+        assert_eq!(state.draft[1].rate, Some(60.0));
+    }
+
+    #[test]
+    fn mirroring_refuses_a_group_without_a_common_mode() {
+        let draft = vec![
+            output("a", 0, 0, "2560x1440"),
+            output("b", 0, 0, "1920x1080"),
+        ];
+        let mut state = state_with(draft);
+        state.status.outputs = vec![
+            output_state("a", &[("2560x1440", &[60.0])]),
+            output_state("b", &[("1920x1080", &[60.0])]),
+        ];
+        let before = state.draft.clone();
+        state.mirror_screens();
+        assert_eq!(state.draft, before);
+        assert!(state.message.contains("no common resolution"));
+    }
+
+    #[test]
+    fn disabled_outputs_do_not_move_the_active_layout() {
+        let mut draft = vec![
+            output("active", 0, 0, "1920x1080"),
+            output("off", -800, -600, "1920x1080"),
+        ];
+        draft[1].enabled = false;
+        assert!(!normalize_draft(&mut draft));
+        assert_eq!((draft[0].x, draft[0].y), (0, 0));
+        assert_eq!((draft[1].x, draft[1].y), (-800, -600));
+    }
+
+    #[test]
+    fn an_unparseable_enabled_mode_blocks_preview() {
+        let state = state_with(vec![output("a", 0, 0, "not-a-mode")]);
+        assert!(validate_draft(&state.draft)
+            .iter()
+            .any(|issue| issue.blocking));
     }
 
     #[test]

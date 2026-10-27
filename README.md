@@ -20,13 +20,16 @@ no xrandr parser and no rollback daemon.
   badge. Disabled outputs stay visible with a dashed frame. Partial overlaps and
   invalid layouts are drawn in the warning colour and block Preview until fixed.
 - Enable or disable outputs, choose the primary screen, resolution, refresh rate
-  and rotation, or use the Single, Extend and Mirror layout actions. Mirroring
+  and rotation, or use the Single, Extend and Mirror layout actions. Disabled
+  outputs do not shift the active desktop origin, and unknown modes block Preview. Mirroring
   moves and edits the mirrored screens as one group.
 - Identify every active screen with its number, connector and model for four
   seconds. Mirrored outputs are listed together on the physical screen.
-- Save, load, rename, update and delete profiles. Delete asks for confirmation.
-  Screens and profiles are paged with the `<`/`>` buttons or the mouse wheel, so
-  every entry stays reachable.
+- Save, load, rename, update and delete profiles. Saving keeps the edited draft
+  and shows that it is saved but not applied; it never replaces the arrangement
+  with the running layout. Renaming or deleting a startup profile updates its
+  startup reference. Delete asks for confirmation. Screens and profiles are paged
+  with the `<`/`>` buttons or the mouse wheel, so every entry stays reachable.
 - Zoom with the mouse wheel over the canvas, pan with the middle mouse button,
   and press `0` to fit the layout again.
 - Preview a layout for 15 seconds, keep it or revert. A separate watchdog keeps
