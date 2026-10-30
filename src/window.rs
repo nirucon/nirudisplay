@@ -1846,6 +1846,25 @@ struct Cursors {
     hand: Cursor,
 }
 
+/// Centre the first window on the screen. A floating dialog that starts at
+/// 0,0 looks like a utility popup under the bar, not a settings window.
+fn initial_position(screen_width: u16, screen_height: u16) -> (i16, i16) {
+    let x = (i32::from(screen_width) - i32::from(WIDTH)) / 2;
+    let y = (i32::from(screen_height) - i32::from(HEIGHT)) / 2;
+    (x.max(0) as i16, y.max(0) as i16)
+}
+
+/// WM_NORMAL_HINTS for the window. Only the minimum size is advertised:
+/// setting PMaxSize with a placeholder 1x1 made NIRUWM clamp the whole dialog
+/// to a tiny window. No resize increments are needed for a pixel-layout UI.
+fn window_size_hints() -> [u32; 18] {
+    let mut hints = [0u32; 18];
+    hints[0] = 1 << 4; // PMinSize
+    hints[5] = u32::from(MIN_WIDTH);
+    hints[6] = u32::from(MIN_HEIGHT);
+    hints
+}
+
 pub struct App {
     c: RustConnection,
     win: Window,
@@ -1874,12 +1893,12 @@ impl App {
     pub fn open() -> Result<Self, String> {
         let (c, screen) = x11rb::connect(None).map_err(|e| e.to_string())?;
         let root = c.setup().roots[screen].root;
-        let depth = c
+        let root_geometry = c
             .get_geometry(root)
             .map_err(|e| e.to_string())?
             .reply()
-            .map_err(|e| e.to_string())?
-            .depth;
+            .map_err(|e| e.to_string())?;
+        let depth = root_geometry.depth;
         if ![24, 32].contains(&depth) {
             return Err(format!(
                 "NIRU Display needs a 24 or 32-bit screen, this one is {depth}"
@@ -1893,12 +1912,13 @@ impl App {
         let win = c.generate_id().map_err(|e| e.to_string())?;
         let gc = c.generate_id().map_err(|e| e.to_string())?;
         let back = c.generate_id().map_err(|e| e.to_string())?;
+        let (initial_x, initial_y) = initial_position(root_geometry.width, root_geometry.height);
         c.create_window(
             COPY_DEPTH_FROM_PARENT,
             win,
             root,
-            0,
-            0,
+            initial_x,
+            initial_y,
             WIDTH,
             HEIGHT,
             0,
@@ -1967,14 +1987,7 @@ impl App {
             &[atom("_NET_WM_WINDOW_TYPE_DIALOG")?],
         )
         .map_err(|e| e.to_string())?;
-        let mut hints = vec![0u32; 18];
-        hints[0] = 1 << 4 | 1 << 5 | 1 << 10 | 1 << 11;
-        hints[5] = u32::from(MIN_WIDTH);
-        hints[6] = u32::from(MIN_HEIGHT);
-        hints[7] = 1;
-        hints[8] = 1;
-        hints[9] = PAD as u32;
-        hints[10] = PAD as u32;
+        let hints = window_size_hints();
         c.change_property32(
             PropMode::REPLACE,
             win,
@@ -4686,6 +4699,27 @@ mod tests {
         assert!(validate_draft(&state.draft)
             .iter()
             .any(|issue| issue.blocking));
+    }
+
+    #[test]
+    fn the_first_window_starts_centered_and_stays_on_screen() {
+        assert_eq!(
+            super::initial_position(1920, 1200),
+            ((1920 - 1120) / 2, (1200 - 760) / 2)
+        );
+        assert_eq!(super::initial_position(800, 600), (0, 0));
+    }
+
+    #[test]
+    fn normal_hints_advertise_only_a_sensible_minimum() {
+        let hints = super::window_size_hints();
+        assert_eq!(hints[0], 1 << 4, "only PMinSize is set");
+        assert_eq!(hints[5], u32::from(super::MIN_WIDTH));
+        assert_eq!(hints[6], u32::from(super::MIN_HEIGHT));
+        assert_eq!(hints[7], 0, "no 1x1 maximum");
+        assert_eq!(hints[8], 0, "no 1x1 maximum");
+        assert_eq!(hints[9], 0, "no resize increment");
+        assert_eq!(hints[10], 0, "no resize increment");
     }
 
     #[test]
