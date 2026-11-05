@@ -52,6 +52,7 @@ const K_I: u32 = b'i' as u32;
 const K_R: u32 = b'r' as u32;
 const K_Z: u32 = b'z' as u32;
 const K_S: u32 = b's' as u32;
+const K_K: u32 = b'k' as u32;
 const K_0: u32 = b'0' as u32;
 const K_N: u32 = b'n' as u32;
 const K_Y: u32 = b'y' as u32;
@@ -182,6 +183,22 @@ pub enum NameAction {
 pub enum Confirm {
     Close,
     Delete(String),
+    /// D3: "Save as…" with the name of another existing profile.
+    Replace(String),
+    /// D9: the window is closed while a preview runs.
+    ClosePreview,
+}
+
+impl Confirm {
+    /// The dialog's buttons, the default first and Cancel last.
+    pub fn buttons(&self) -> &'static [&'static str] {
+        match self {
+            Confirm::Close => &["Close", "Cancel"],
+            Confirm::Delete(_) => &["Delete", "Cancel"],
+            Confirm::Replace(_) => &["Replace", "Cancel"],
+            Confirm::ClosePreview => &["Keep layout", "Revert", "Cancel"],
+        }
+    }
 }
 
 /// What the window does with a finished backend job. It travels to the
@@ -460,9 +477,24 @@ impl State {
             }
         };
         match done.after {
-            After::Reload { forced, .. } => {
+            After::Reload { forced, background } => {
                 if let Some(status) = status {
+                    // D4: R keeps the edited draft one Ctrl+Z away.
+                    let restorable = forced && !background && self.dirty;
+                    if restorable {
+                        self.checkpoint();
+                    }
                     self.apply_status(status, forced);
+                    if forced && !background {
+                        self.set_message(
+                            if restorable {
+                                "Reloaded. Ctrl+Z restores your draft."
+                            } else {
+                                "Reloaded the display state."
+                            },
+                            false,
+                        );
+                    }
                 }
             }
             After::Preview { layout } => {
@@ -574,9 +606,6 @@ impl State {
     pub fn apply_status(&mut self, status: backend::Status, force_draft: bool) {
         let was_preview = self.had_preview;
         let active = status.preview.is_some();
-        if force_draft {
-            self.undo.clear();
-        }
         if force_draft || !self.dirty {
             self.draft = draft_from_status(&status);
             self.dirty = false;
@@ -1042,7 +1071,8 @@ impl State {
     }
 
     pub fn profile_from_draft(&self) -> backend::Profile {
-        let normalized = normalized_draft(&self.draft);
+        let mut normalized = normalized_draft(&self.draft);
+        single_primary(&mut normalized);
         backend::Profile {
             name: self
                 .selected_profile
@@ -1109,6 +1139,7 @@ impl State {
             }
         }
         normalize_draft(&mut draft);
+        single_primary(&mut draft);
         self.draft = draft;
         self.selected = self
             .draft
@@ -1124,6 +1155,26 @@ impl State {
             false,
         );
         Ok(())
+    }
+
+    /// The name of the profile that was loaded into the draft, if any.
+    pub fn loaded_profile_name(&self) -> Option<&str> {
+        self.selected_profile
+            .and_then(|index| self.status.profiles.get(index))
+            .map(|profile| profile.name.as_str())
+    }
+
+    /// D3: saving under another existing profile's name replaces it and
+    /// asks first. Saving under the loaded profile's own name is an update.
+    pub fn save_needs_confirm(&self, name: &str) -> bool {
+        let name = name.trim();
+        !name.is_empty()
+            && self.loaded_profile_name() != Some(name)
+            && self
+                .status
+                .profiles
+                .iter()
+                .any(|profile| profile.name == name)
     }
 
     pub fn apply_preview(&mut self) -> Result<(), String> {
@@ -1302,7 +1353,17 @@ fn draft_from_status(status: &backend::Status) -> Vec<DraftOutput> {
         }
         draft.push(output);
     }
+    single_primary(&mut draft);
     draft
+}
+
+/// D7: with exactly one enabled screen that screen is the primary one,
+/// whatever RandR reports. Many laptops have no RandR primary at all.
+fn single_primary(draft: &mut [DraftOutput]) {
+    let mut enabled = draft.iter_mut().filter(|output| output.enabled);
+    if let (Some(only), None) = (enabled.next(), enabled.next()) {
+        only.primary = true;
+    }
 }
 
 fn normalize_draft(draft: &mut [DraftOutput]) -> bool {
@@ -1381,7 +1442,7 @@ fn validate_draft(draft: &[DraftOutput]) -> Vec<Issue> {
             text: "A selected screen has no usable display mode.".into(),
         });
     }
-    if !enabled.iter().any(|output| output.primary) {
+    if enabled.len() > 1 && !enabled.iter().any(|output| output.primary) {
         issues.push(Issue {
             blocking: false,
             text: "No enabled screen is set as primary.".into(),
@@ -1881,23 +1942,19 @@ fn confirm_rect(w: u16, h: u16) -> Rectangle {
     }
 }
 
-fn confirm_buttons(w: u16, h: u16) -> (Rectangle, Rectangle) {
+fn confirm_buttons(w: u16, h: u16, count: usize) -> Vec<Rectangle> {
     let rect = confirm_rect(w, h);
-    let width = (rect.width.saturating_sub(38)) / 2;
-    (
-        Rectangle {
-            x: rect.x + 16,
+    let count = count.max(1) as u16;
+    let gap = 6u16;
+    let width = (rect.width.saturating_sub(32 + gap * (count - 1))) / count;
+    (0..count)
+        .map(|index| Rectangle {
+            x: rect.x + 16 + i16::try_from((width + gap) * index).unwrap_or(0),
             y: rect.y + i16::try_from(rect.height).unwrap_or(0) - 42,
             width,
             height: 28,
-        },
-        Rectangle {
-            x: rect.x + 16 + i16::try_from(width).unwrap_or(0) + 6,
-            y: rect.y + i16::try_from(rect.height).unwrap_or(0) - 42,
-            width,
-            height: 28,
-        },
-    )
+        })
+        .collect()
 }
 
 fn hit(state: &State, ui: &Ui, x: i16, y: i16) -> Option<Hit> {
@@ -3706,14 +3763,16 @@ impl App {
             true,
             self.palette.surface,
         )?;
-        let exists = !state.name_text.trim().is_empty()
-            && state
-                .status
-                .profiles
-                .iter()
-                .any(|profile| profile.name == state.name_text.trim());
-        let hint = if exists {
-            "Enter replaces the existing profile · Esc cancels"
+        let name = state.name_text.trim();
+        let replace = state.name_mode == Some(NameAction::Save) && state.save_needs_confirm(name);
+        let update = state.name_mode == Some(NameAction::Save)
+            && !name.is_empty()
+            && state.loaded_profile_name() == Some(name);
+        let exists = replace;
+        let hint = if replace {
+            "A profile with this name exists · Enter asks before replacing it · Esc cancels"
+        } else if update {
+            "Enter updates this profile · Esc cancels"
         } else {
             "Enter confirms · Esc cancels · spaces and Swedish letters are allowed"
         };
@@ -3734,45 +3793,65 @@ impl App {
     }
 
     fn paint_confirm(&self, state: &State) -> Result<(), String> {
+        let Some(confirm) = &state.confirm else {
+            return Ok(());
+        };
         let rect = confirm_rect(self.w, self.h);
         self.fill(self.palette.background, rect)?;
         self.outline(rect, 2, self.palette.error())?;
-        let (title, body) = match &state.confirm {
-            Some(Confirm::Close) => (
-                "Close with unsaved changes?",
-                "The draft has not been previewed and kept.",
+        let (title, body) = match confirm {
+            Confirm::Close => (
+                "Close with unsaved changes?".to_string(),
+                "The draft has not been previewed and kept.".to_string(),
             ),
-            Some(Confirm::Delete(name)) => ("Delete display profile?", name.as_str()),
-            None => ("", ""),
+            Confirm::Delete(name) => ("Delete display profile?".to_string(), name.clone()),
+            Confirm::Replace(name) => (
+                format!("Replace profile \u{2039}{name}\u{203a}?"),
+                "Its saved layout is overwritten with this draft.".to_string(),
+            ),
+            Confirm::ClosePreview => (
+                "Keep the previewed layout?".to_string(),
+                if state.preview_changed() {
+                    "A preview is running. Draft changes made after it are not saved.".to_string()
+                } else {
+                    "A preview is running. Revert restores the previous layout.".to_string()
+                },
+            ),
         };
-        self.label(
+        self.label_fit(
             rect.x + 16,
             rect.y + 14,
-            title,
+            &title,
             self.palette.foreground,
+            self.palette.background,
             14.0,
+            f32::from(rect.width) - 32.0,
         )?;
         self.label_fit(
             rect.x + 16,
             rect.y + 46,
-            body,
+            &body,
             self.palette.muted,
             self.palette.background,
             12.0,
             f32::from(rect.width) - 32.0,
         )?;
-        let (yes, no) = confirm_buttons(self.w, self.h);
-        let yes_label = if matches!(state.confirm, Some(Confirm::Close)) {
-            "Close"
-        } else {
-            "Delete"
-        };
-        self.button(yes, yes_label, true, true, self.palette.surface)?;
-        self.button(no, "Cancel", false, true, self.palette.surface)?;
+        let labels = confirm.buttons();
+        for (index, (button, label)) in confirm_buttons(self.w, self.h, labels.len())
+            .into_iter()
+            .zip(labels)
+            .enumerate()
+        {
+            self.button(button, label, index == 0, true, self.palette.surface)?;
+        }
         self.label(
             rect.x + 16,
             rect.y + i16::try_from(rect.height).unwrap_or(0) - 64,
-            "Enter confirms · Esc cancels",
+            if matches!(confirm, Confirm::ClosePreview) {
+                "Enter keeps · R reverts · Esc cancels"
+            } else {
+                "Enter confirms · Esc cancels"
+            },
             self.palette.muted,
             11.0,
         )?;
@@ -3804,10 +3883,10 @@ impl App {
             "R            reload the actual display state",
             "Ctrl+Z       undo the last draft change",
             "F1           open or close this help",
-            "Esc/Q        close; an active preview reverts on close or timeout",
+            "Esc/Q        close; during a preview it asks: Keep layout or Revert",
             "Profiles     click to load, then Preview; Save as… stores the draft",
             "Preview      changes stay for 15 s; Keep confirms, Revert restores",
-            "Screens      drag the < > buttons or use the wheel to page",
+            "Screens      click the < > buttons or use the wheel to page",
             "Canvas       wheel zooms; middle-drag pans; 0 resets the view",
         ];
         for (index, line) in lines.iter().enumerate() {
@@ -3827,19 +3906,12 @@ impl App {
     fn paint_footer(&self, state: &State, ui: &Ui, help: bool) -> Result<(), String> {
         let issues = validate_draft(&state.draft);
         let blocking = issues.iter().find(|issue| issue.blocking);
-        let warning = issues.iter().find(|issue| !issue.blocking);
         let (message, colour) = if state.busy {
             (state.busy_text.to_string(), self.palette.muted)
         } else if state.message_is_error {
             (state.message.clone(), self.palette.error())
         } else if let Some(issue) = blocking {
             (issue.text.clone(), self.palette.error())
-        } else if !state.preview_active() {
-            if let Some(issue) = warning {
-                (issue.text.clone(), self.palette.warning())
-            } else {
-                (state.message.clone(), self.palette.muted)
-            }
         } else {
             (state.message.clone(), self.palette.muted)
         };
@@ -4157,9 +4229,6 @@ pub fn run(app: &mut App, state: &mut State) -> Result<(), String> {
         }
         wait_for_input(&fds, lp.timeout(app, state, Instant::now()));
     }
-    if state.preview_active() && !state.busy {
-        let _ = backend::revert();
-    }
     Ok(())
 }
 
@@ -4179,7 +4248,6 @@ fn handle_event(
     ) {
         lp.dirty = true;
     }
-    let help = lp.help;
     match event {
         Event::Expose(e) if e.count != 0 => {}
         Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
@@ -4236,6 +4304,10 @@ fn handle_event(
                         state.name_text.clear();
                         state.focus = None;
                         let result = match action {
+                            Some(NameAction::Save) if state.save_needs_confirm(&text) => {
+                                state.confirm = Some(Confirm::Replace(text));
+                                Ok(())
+                            }
                             Some(NameAction::Save) => state.save(&text),
                             Some(NameAction::Rename) => state.rename(&text),
                             None => Ok(()),
@@ -4254,14 +4326,15 @@ fn handle_event(
                 }
                 return Ok(());
             }
-            if state.confirm.is_some() {
+            if let Some(confirm) = &state.confirm {
+                let preview = matches!(confirm, Confirm::ClosePreview);
                 match key {
                     K_ESCAPE | K_N => {
                         state.confirm = None;
                     }
-                    K_RETURN | K_Y => {
-                        confirm_action(app, state, help)?;
-                    }
+                    K_RETURN | K_Y => confirm_action(state, 0),
+                    K_K if preview => confirm_action(state, 0),
+                    K_R if preview => confirm_action(state, 1),
                     _ => {}
                 }
                 return Ok(());
@@ -4358,12 +4431,13 @@ fn handle_event(
             if state.busy || state.name_mode.is_some() {
                 return Ok(());
             }
-            if state.confirm.is_some() {
-                let (yes, no) = confirm_buttons(app.w, app.h);
-                if e.detail == 1 && contains(yes, e.event_x, e.event_y) {
-                    confirm_action(app, state, help)?;
-                } else if e.detail == 1 && contains(no, e.event_x, e.event_y) {
-                    state.confirm = None;
+            if let Some(confirm) = &state.confirm {
+                let buttons = confirm_buttons(app.w, app.h, confirm.buttons().len());
+                if let Some(index) = buttons
+                    .iter()
+                    .position(|rect| e.detail == 1 && contains(*rect, e.event_x, e.event_y))
+                {
+                    confirm_action(state, index);
                 }
                 return Ok(());
             }
@@ -4483,28 +4557,43 @@ fn request_close(state: &mut State) {
     if state.confirm.is_some() {
         return;
     }
-    if state.dirty {
+    // D9: closing never reverts a preview without asking. A crash or a
+    // kill still reverts through niructl's watchdog.
+    if state.preview_active() {
+        state.confirm = Some(Confirm::ClosePreview);
+    } else if state.dirty {
         state.confirm = Some(Confirm::Close);
     } else {
         state.quit = true;
     }
 }
 
-fn confirm_action(_app: &mut App, state: &mut State, _help: bool) -> Result<(), String> {
+/// Press button `index` of the open confirm dialog; the last is Cancel.
+fn confirm_action(state: &mut State, index: usize) {
     let Some(confirm) = state.confirm.take() else {
-        return Ok(());
+        return;
     };
-    match confirm {
-        Confirm::Close => {
+    let result = match (confirm, index) {
+        (Confirm::Close, 0) => {
             state.quit = true;
+            Ok(())
         }
-        Confirm::Delete(name) => {
-            if let Err(err) = state.delete_named(&name) {
-                state.set_message(err, true);
-            }
+        (Confirm::Delete(name), 0) => state.delete_named(&name),
+        (Confirm::Replace(name), 0) => state.save(&name),
+        // D9: Keep layout or Revert, then close once niructl has answered.
+        (Confirm::ClosePreview, 0) => {
+            state.submit(backend::Job::Keep, After::Keep { quit: true });
+            Ok(())
         }
+        (Confirm::ClosePreview, 1) => {
+            state.submit(backend::Job::Revert, After::Revert { quit: true });
+            Ok(())
+        }
+        _ => Ok(()),
+    };
+    if let Err(err) = result {
+        state.set_message(err, true);
     }
-    Ok(())
 }
 
 fn page_outputs(state: &mut State, ui: &Ui, direction: i32) {
@@ -5131,5 +5220,177 @@ mod tests {
         assert_eq!((state.draft[0].x, state.draft[0].y), (10, 5));
         assert_eq!((state.draft[1].x, state.draft[1].y), (10, 5));
         assert_eq!((state.draft[2].x, state.draft[2].y), (1920, 0));
+    }
+
+    fn profile(name: &str, outputs: &[&str]) -> backend::Profile {
+        backend::Profile {
+            name: name.into(),
+            outputs: outputs
+                .iter()
+                .enumerate()
+                .map(|(index, output)| backend::ProfileOutput {
+                    name: (*output).into(),
+                    mode: "1920x1080".into(),
+                    rate: Some(60.0),
+                    position: backend::position_string(index as i32 * 1920, 0),
+                    rotation: "normal".into(),
+                    primary: index == 0,
+                })
+                .collect(),
+        }
+    }
+
+    fn done(after: After, status: backend::Status) -> backend::Done<After> {
+        backend::Done {
+            seq: 1,
+            after,
+            result: Ok(()),
+            status: Ok(status),
+        }
+    }
+
+    #[test]
+    fn save_as_an_other_existing_name_asks_and_the_loaded_name_updates() {
+        let mut state = state_with(vec![output("a", 0, 0, "1920x1080")]);
+        state.status.profiles = vec![profile("Home", &["a"]), profile("Work", &["a"])];
+        state.selected_profile = Some(0);
+        assert!(
+            !state.save_needs_confirm("Home"),
+            "the loaded profile updates"
+        );
+        assert!(state.save_needs_confirm(" Work "), "another profile asks");
+        assert!(!state.save_needs_confirm("New"), "a new name just saves");
+        assert!(!state.save_needs_confirm("  "));
+        state.selected_profile = None;
+        assert!(state.save_needs_confirm("Home"), "nothing loaded: asks");
+        // Replace only saves once confirmed.
+        state.confirm = Some(Confirm::Replace("Work".into()));
+        confirm_action(&mut state, 1);
+        assert!(state.outbox.is_empty(), "Cancel saves nothing");
+        state.confirm = Some(Confirm::Replace("Work".into()));
+        confirm_action(&mut state, 0);
+        assert!(matches!(
+            state.outbox.first(),
+            Some((backend::Job::Save { name, .. }, After::Save { update: true, .. })) if name == "Work"
+        ));
+        assert!(state.busy);
+    }
+
+    #[test]
+    fn r_keeps_the_edited_draft_one_undo_away() {
+        let mut state = state_with(vec![output("a", 0, 0, "1920x1080")]);
+        state.draft[0].primary = true;
+        state.move_selected(100, 0);
+        let edited = state.draft.clone();
+        assert!(state.dirty);
+        let status = backend::Status {
+            outputs: vec![output_state("a", &[("1920x1080", &[60.0])])],
+            ..Default::default()
+        };
+        state.request_reload(true);
+        let (job, after) = state.outbox.pop().unwrap();
+        assert_eq!(job, backend::Job::Status);
+        state.finish(done(after, status));
+        assert!(!state.dirty);
+        assert_eq!(state.draft[0].x, 0, "the running layout is shown");
+        assert_eq!(state.message, "Reloaded. Ctrl+Z restores your draft.");
+        state.undo();
+        assert_eq!(state.draft, edited, "Ctrl+Z restores the draft");
+        assert!(state.dirty);
+        // Earlier history survives the reload too.
+        state.undo();
+        assert_eq!(state.draft[0].x, 0);
+    }
+
+    #[test]
+    fn a_single_enabled_screen_is_primary_without_a_warning() {
+        let status = backend::Status {
+            outputs: vec![output_state("eDP-1", &[("1920x1080", &[60.0])])],
+            ..Default::default()
+        };
+        assert!(!status.outputs[0].primary, "RandR reports no primary");
+        let state = State::new(status);
+        assert!(state.draft[0].primary);
+        assert!(validate_draft(&state.draft).is_empty(), "no nag");
+        assert!(
+            state.profile_from_draft().outputs[0].primary,
+            "sent as primary"
+        );
+        assert!(!state.dirty);
+        // Two enabled screens without a primary still warn, once.
+        let two = vec![
+            output("a", 0, 0, "1920x1080"),
+            output("b", 1920, 0, "1920x1080"),
+        ];
+        let issues = validate_draft(&two);
+        assert_eq!(issues.len(), 1);
+        assert!(!issues[0].blocking);
+    }
+
+    #[test]
+    fn closing_during_a_preview_asks_and_keep_closes_after_niructl_answers() {
+        let mut state = state_with(vec![output("a", 0, 0, "1920x1080")]);
+        state.status.preview = Some(backend::Preview {
+            name: "Draft".into(),
+            token: "t1".into(),
+            seconds_left: 12,
+        });
+        request_close(&mut state);
+        assert_eq!(state.confirm, Some(Confirm::ClosePreview));
+        assert!(!state.quit, "closing never reverts or quits silently");
+        assert_eq!(
+            Confirm::ClosePreview.buttons(),
+            &["Keep layout", "Revert", "Cancel"]
+        );
+        confirm_action(&mut state, 2);
+        assert!(state.confirm.is_none() && state.outbox.is_empty(), "Cancel");
+        request_close(&mut state);
+        confirm_action(&mut state, 0);
+        let (job, after) = state.outbox.pop().unwrap();
+        assert_eq!(job, backend::Job::Keep);
+        assert!(!state.quit, "waits for the answer");
+        state.finish(done(after, backend::Status::default()));
+        assert!(state.quit);
+        // Revert closes the same way.
+        let mut state = state_with(vec![output("a", 0, 0, "1920x1080")]);
+        state.status.preview = state_with(Vec::new())
+            .status
+            .preview
+            .or(Some(backend::Preview {
+                name: "Draft".into(),
+                token: "t2".into(),
+                seconds_left: 3,
+            }));
+        request_close(&mut state);
+        confirm_action(&mut state, 1);
+        assert_eq!(state.outbox[0].0, backend::Job::Revert);
+    }
+
+    #[test]
+    fn a_late_status_never_replaces_a_newer_one() {
+        let mut state = state_with(Vec::new());
+        let newer = backend::Status {
+            profiles: vec![profile("New", &[])],
+            ..Default::default()
+        };
+        let mut answer = done(
+            After::Reload {
+                forced: false,
+                background: true,
+            },
+            newer,
+        );
+        answer.seq = 5;
+        state.finish(answer);
+        let mut answer = done(
+            After::Reload {
+                forced: false,
+                background: true,
+            },
+            backend::Status::default(),
+        );
+        answer.seq = 4;
+        state.finish(answer);
+        assert_eq!(state.status.profiles.len(), 1);
     }
 }

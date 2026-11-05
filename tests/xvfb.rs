@@ -164,6 +164,11 @@ fn start() -> Session {
         r#"{"name":"TV","outputs":[{"name":"HDMI-1","mode":"1920x1080","rate":60.0,"position":"0x0","rotation":"normal","primary":true}]}"#,
     )
     .unwrap();
+    fs::write(
+        root.join("profiles/Work.json"),
+        r#"{"name":"Work","outputs":[{"name":"DP-1","mode":"2560x1440","rate":59.95,"position":"0x0","rotation":"normal","primary":true}]}"#,
+    )
+    .unwrap();
     let niructl = root.join("niructl");
     fs::write(&niructl, FIXTURE).unwrap();
     fs::set_permissions(&niructl, fs::Permissions::from_mode(0o755)).unwrap();
@@ -235,7 +240,7 @@ fn events_typing_preview_and_close_under_xvfb() {
     // The keymap is Swedish before the window reads it; the window must
     // still follow a MappingNotify, which the second setxkbmap below sends.
     s.run("setxkbmap", &["us"]);
-    let window = open_window(&mut s);
+    open_window(&mut s);
     s.wait_log(Duration::from_secs(10), "the first status read", |l| {
         l.iter().any(|x| x == "display status --json")
     });
@@ -314,6 +319,62 @@ fn events_typing_preview_and_close_under_xvfb() {
     );
     let saved = fs::read_to_string(s.root.join("profiles/Hemma (dock)_Å@ ~$.json")).unwrap();
     assert!(saved.contains("\"name\":\"Hemma (dock)_Å@ ~$\""), "{saved}");
+    sleep(Duration::from_millis(800));
+
+    // D3: "Save as…" under the loaded profile's own name updates it
+    // without asking...
+    s.key(&["ctrl+s", "Return"]);
+    s.wait_log(Duration::from_secs(5), "the update", |l| {
+        count(l, "saved [Hemma (dock)_Å@ ~$]") == 2
+    });
+    sleep(Duration::from_millis(500));
+    // ...while another existing name asks first, and Esc keeps it.
+    s.key(&["ctrl+s"]);
+    s.key(&["BackSpace"; 20]);
+    s.key(&["W", "o", "r", "k", "Return"]);
+    sleep(Duration::from_millis(500));
+    assert!(
+        !s.log().iter().any(|x| x == "saved [Work]"),
+        "saved without asking"
+    );
+    s.key(&["Escape"]);
+    sleep(Duration::from_millis(300));
+    assert!(!s.log().iter().any(|x| x == "saved [Work]"), "Esc saved");
+    s.key(&["ctrl+s"]);
+    s.key(&["BackSpace"; 20]);
+    s.key(&["W", "o", "r", "k", "Return", "Return"]);
+    s.wait_log(Duration::from_secs(5), "the confirmed replace", |l| {
+        l.iter().any(|x| x == "saved [Work]")
+    });
+    sleep(Duration::from_millis(500));
+
+    // D9: closing during a preview asks; Keep layout keeps and closes.
+    s.key(&["Return"]);
+    s.wait_log(Duration::from_secs(5), "the preview", |l| {
+        l.iter().any(|x| x.starts_with("previewed "))
+    });
+    sleep(Duration::from_millis(500));
+    s.xdotool(&["key", "Escape"]);
+    sleep(Duration::from_millis(500));
+    assert!(!s.exited(), "Esc closed the window during a preview");
+    assert!(
+        !s.log().iter().any(|x| x.starts_with("done ")),
+        "closing kept or reverted without asking: {:?}",
+        s.log()
+    );
+    s.key(&["Return"]);
+    s.wait_log(Duration::from_secs(5), "the keep on close", |l| {
+        l.iter().any(|x| x.starts_with("done keep "))
+    });
+    let closed = Instant::now();
+    while !s.exited() {
+        assert!(closed.elapsed() < Duration::from_secs(3), "did not close");
+        sleep(Duration::from_millis(25));
+    }
+    let window = open_window(&mut s);
+    s.wait_log(Duration::from_secs(10), "the second window", |l| {
+        count(l, "display status --json") >= 2
+    });
     sleep(Duration::from_millis(800));
 
     // D5: a slow preview does not block repainting, and Esc still closes.
