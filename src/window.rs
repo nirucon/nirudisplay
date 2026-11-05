@@ -4,11 +4,15 @@
 //! sends that draft through the same preview/keep/revert transaction the CLI
 //! and the launcher use. It owns no profile store and runs no display daemon.
 
-use crate::{backend, keyboard, text, theme};
+use crate::{backend, keyboard, text, theme, watch};
 use std::time::{Duration, Instant};
 use x11rb::{
     connection::Connection,
-    protocol::{xproto::*, Event},
+    protocol::{
+        randr::{self, ConnectionExt as _},
+        xproto::*,
+        Event,
+    },
     rust_connection::RustConnection,
     wrapper::ConnectionExt as _,
     COPY_DEPTH_FROM_PARENT,
@@ -47,6 +51,7 @@ const K_Q: u32 = b'q' as u32;
 const K_I: u32 = b'i' as u32;
 const K_R: u32 = b'r' as u32;
 const K_Z: u32 = b'z' as u32;
+const K_S: u32 = b's' as u32;
 const K_0: u32 = b'0' as u32;
 const K_N: u32 = b'n' as u32;
 const K_Y: u32 = b'y' as u32;
@@ -179,6 +184,70 @@ pub enum Confirm {
     Delete(String),
 }
 
+/// What the window does with a finished backend job. It travels to the
+/// worker with the job and back with the answer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum After {
+    /// A status read. `forced` replaces an edited draft (the `R` key);
+    /// `background` reads are the window's own reaction to a change and
+    /// never make the window busy.
+    Reload {
+        forced: bool,
+        background: bool,
+    },
+    Preview {
+        layout: Vec<DraftOutput>,
+    },
+    Keep {
+        quit: bool,
+    },
+    Revert {
+        quit: bool,
+    },
+    Save {
+        name: String,
+        update: bool,
+    },
+    Rename {
+        old: String,
+        new: String,
+    },
+    Delete {
+        name: String,
+    },
+    Startup {
+        enabled: bool,
+    },
+}
+
+impl After {
+    fn background(&self) -> bool {
+        matches!(
+            self,
+            After::Reload {
+                background: true,
+                ..
+            }
+        )
+    }
+
+    fn busy_text(&self) -> &'static str {
+        match self {
+            After::Reload { .. } => "Reading the display state…",
+            After::Preview { .. } => "Applying the layout…",
+            After::Keep { .. } => "Keeping the layout…",
+            After::Revert { .. } => "Restoring the previous layout…",
+            After::Save { .. } => "Saving the profile…",
+            After::Rename { .. } => "Renaming the profile…",
+            After::Delete { .. } => "Deleting the profile…",
+            After::Startup { .. } => "Updating the login profile…",
+        }
+    }
+}
+
+/// How long a preview asks the watchdog for.
+pub const PREVIEW_SECONDS: u64 = 15;
+
 pub struct State {
     pub status: backend::Status,
     pub draft: Vec<DraftOutput>,
@@ -187,7 +256,9 @@ pub struct State {
     pub focus: Option<Hit>,
     pub message: String,
     pub message_is_error: bool,
+    /// An action is running on the worker; only Esc is accepted.
     pub busy: bool,
+    pub busy_text: &'static str,
     pub dirty: bool,
     pub name_mode: Option<NameAction>,
     pub name_text: String,
@@ -195,18 +266,60 @@ pub struct State {
     pub profile_scroll: usize,
     pub confirm: Option<Confirm>,
     pub quit: bool,
+    /// Jobs for the worker, taken by the event loop.
+    pub outbox: Vec<(backend::Job, After)>,
+    /// Actions submitted and not answered yet.
+    in_flight: usize,
+    /// The sequence number of the newest status applied. An older answer
+    /// never replaces it.
+    status_seq: u64,
+    /// The running preview was started from this window.
+    pub own_preview: bool,
+    preview_token: Option<String>,
+    preview_deadline: Option<Instant>,
+    preview_total: u64,
     had_preview: bool,
     preview_layout: Option<Vec<DraftOutput>>,
     undo: Vec<Vec<DraftOutput>>,
 }
 
 impl State {
-    pub fn load() -> Result<Self, String> {
-        let status = backend::read_status()?;
-        backend::adopt_preview(status.preview.as_ref());
+    pub fn new(status: backend::Status) -> Self {
         let draft = draft_from_status(&status);
+        Self {
+            status: backend::Status::default(),
+            draft,
+            selected: 0,
+            selected_profile: None,
+            focus: None,
+            message: String::new(),
+            message_is_error: false,
+            busy: false,
+            busy_text: "",
+            dirty: false,
+            name_mode: None,
+            name_text: String::new(),
+            output_scroll: 0,
+            profile_scroll: 0,
+            confirm: None,
+            quit: false,
+            outbox: Vec::new(),
+            in_flight: 0,
+            status_seq: 0,
+            own_preview: false,
+            preview_token: None,
+            preview_deadline: None,
+            preview_total: PREVIEW_SECONDS,
+            had_preview: false,
+            preview_layout: None,
+            undo: Vec::new(),
+        }
+        .with_status(status)
+    }
+
+    fn with_status(mut self, status: backend::Status) -> Self {
         let had_preview = status.preview.is_some();
-        let message = status
+        self.message = status
             .preview
             .as_ref()
             .map(|preview| {
@@ -218,26 +331,17 @@ impl State {
             .unwrap_or_else(|| {
                 "Drag a screen to move it. Changes are previewed before they are kept.".into()
             });
-        Ok(Self {
-            status,
-            draft: draft.clone(),
-            selected: 0,
-            selected_profile: None,
-            focus: None,
-            message,
-            message_is_error: false,
-            busy: false,
-            dirty: false,
-            name_mode: None,
-            name_text: String::new(),
-            output_scroll: 0,
-            profile_scroll: 0,
-            confirm: None,
-            quit: false,
-            had_preview,
-            preview_layout: had_preview.then_some(draft),
-            undo: Vec::new(),
-        })
+        self.had_preview = had_preview;
+        self.preview_layout = had_preview.then(|| self.draft.clone());
+        self.status = status;
+        self.sync_preview_clock(Instant::now());
+        self
+    }
+
+    pub fn load() -> Result<Self, String> {
+        let status = backend::read_status()?;
+        backend::adopt_preview(status.preview.as_ref());
+        Ok(Self::new(status))
     }
 
     pub fn set_message(&mut self, text: impl Into<String>, error: bool) {
@@ -260,14 +364,214 @@ impl State {
             .unwrap_or(false)
     }
 
+    /// The preview countdown runs from a local deadline, set when the
+    /// preview is first seen and corrected by later status reads, so the
+    /// window repaints once per second without asking niructl.
+    fn sync_preview_clock(&mut self, now: Instant) {
+        let Some(preview) = &self.status.preview else {
+            self.preview_token = None;
+            self.preview_deadline = None;
+            self.own_preview = false;
+            return;
+        };
+        let target = now + Duration::from_secs(preview.seconds_left);
+        if self.preview_token.as_deref() != Some(preview.token.as_str()) {
+            self.preview_token = Some(preview.token.clone());
+            self.preview_deadline = Some(target);
+            self.preview_total = preview.seconds_left.max(PREVIEW_SECONDS);
+            self.own_preview = false;
+        } else if let Some(deadline) = self.preview_deadline {
+            let drift = if deadline > target {
+                deadline - target
+            } else {
+                target - deadline
+            };
+            if drift > Duration::from_millis(1500) {
+                self.preview_deadline = Some(target);
+            }
+        }
+    }
+
+    /// Whole seconds left in the preview, rounded up like a countdown.
+    pub fn preview_seconds_left(&self, now: Instant) -> Option<u64> {
+        self.status.preview.as_ref()?;
+        let left = self
+            .preview_deadline?
+            .saturating_duration_since(now)
+            .as_millis();
+        Some(left.div_ceil(1000) as u64)
+    }
+
+    pub fn preview_deadline(&self) -> Option<Instant> {
+        self.preview_deadline
+    }
+
     fn refresh_dirty_from_status(&mut self) {
         let actual = draft_from_status(&self.status);
         self.dirty = !layouts_match(&self.draft, &actual);
     }
 
-    pub fn reload(&mut self, force_draft: bool) -> Result<(), String> {
-        let status = backend::read_status()?;
-        backend::adopt_preview(status.preview.as_ref());
+    /// Queue a job for the worker. Actions make the window busy; a
+    /// background status read does not.
+    pub fn submit(&mut self, job: backend::Job, after: After) {
+        if !after.background() {
+            self.in_flight += 1;
+            self.busy = true;
+            self.busy_text = after.busy_text();
+        }
+        self.outbox.push((job, after));
+    }
+
+    /// Ask for a status read; `forced` replaces an edited draft (`R`).
+    pub fn request_reload(&mut self, forced: bool) {
+        self.submit(
+            backend::Job::Status,
+            After::Reload {
+                forced,
+                background: false,
+            },
+        );
+    }
+
+    /// Apply one answer from the worker.
+    pub fn finish(&mut self, done: backend::Done<After>) {
+        if !done.after.background() {
+            self.in_flight = self.in_flight.saturating_sub(1);
+            self.busy = self.in_flight > 0;
+        }
+        let status = match done.status {
+            // The worker answers in order, but a result that is older than
+            // the status on screen is still never applied.
+            Ok(_) if done.seq < self.status_seq => None,
+            Ok(status) => {
+                self.status_seq = done.seq;
+                Some(status)
+            }
+            Err(err) => {
+                self.set_message(err, true);
+                None
+            }
+        };
+        let failed = match done.result {
+            Ok(()) => false,
+            Err(err) => {
+                self.set_message(err, true);
+                true
+            }
+        };
+        match done.after {
+            After::Reload { forced, .. } => {
+                if let Some(status) = status {
+                    self.apply_status(status, forced);
+                }
+            }
+            After::Preview { layout } => {
+                if !failed {
+                    self.dirty = false;
+                    self.had_preview = true;
+                    self.preview_layout = Some(layout);
+                    self.set_message(
+                        format!(
+                            "Previewing for {PREVIEW_SECONDS} s. Keep the result or let it revert."
+                        ),
+                        false,
+                    );
+                }
+                if let Some(status) = status {
+                    self.apply_status(status, false);
+                }
+                if !failed && self.preview_active() {
+                    self.own_preview = true;
+                }
+            }
+            After::Keep { quit } | After::Revert { quit } => {
+                let kept = matches!(done.after, After::Keep { .. });
+                if !failed {
+                    self.dirty = false;
+                    self.had_preview = false;
+                    self.preview_layout = None;
+                    self.own_preview = false;
+                    self.set_message(
+                        if kept {
+                            "Display layout kept."
+                        } else {
+                            "Previous layout restored."
+                        },
+                        false,
+                    );
+                    self.quit |= quit;
+                }
+                if let Some(status) = status {
+                    self.apply_status(status, !failed);
+                }
+            }
+            After::Save { name, update } => {
+                if let Some(status) = status {
+                    self.replace_status(status);
+                    self.refresh_dirty_from_status();
+                }
+                if !failed {
+                    self.set_message(
+                        if update {
+                            format!("Updated display profile {name}.")
+                        } else {
+                            format!("Saved display profile {name}.")
+                        },
+                        false,
+                    );
+                    self.select_profile_named(&name);
+                }
+            }
+            After::Rename { old, new } => {
+                if let Some(status) = status {
+                    self.replace_status(status);
+                }
+                if !failed {
+                    self.set_message(format!("Renamed {old} to {new}."), false);
+                    self.select_profile_named(&new);
+                }
+            }
+            After::Delete { name } => {
+                if let Some(status) = status {
+                    self.replace_status(status);
+                    self.refresh_dirty_from_status();
+                }
+                if !failed {
+                    self.selected_profile = None;
+                    self.set_message(format!("Deleted display profile {name}."), false);
+                }
+            }
+            After::Startup { enabled } => {
+                if let Some(status) = status {
+                    self.apply_status(status, false);
+                }
+                if !failed {
+                    self.set_message(
+                        if enabled {
+                            "This profile will be applied at the next login."
+                        } else {
+                            "Startup profile disabled."
+                        },
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
+    fn select_profile_named(&mut self, name: &str) {
+        self.selected_profile = self
+            .status
+            .profiles
+            .iter()
+            .position(|profile| profile.name == name);
+        if let Some(index) = self.selected_profile {
+            self.profile_scroll = index / PROFILE_PAGE;
+        }
+    }
+
+    /// Take a new status. An edited draft is kept unless `force_draft`.
+    pub fn apply_status(&mut self, status: backend::Status, force_draft: bool) {
         let was_preview = self.had_preview;
         let active = status.preview.is_some();
         if force_draft {
@@ -307,20 +611,18 @@ impl State {
             self.message_is_error = false;
         }
         self.status = status;
+        self.sync_preview_clock(Instant::now());
         self.clamp_scrolls();
-        Ok(())
     }
 
-    /// Refresh profile/startup metadata without replacing an edited draft.
-    pub fn refresh_profiles(&mut self) -> Result<(), String> {
-        let status = backend::read_status()?;
-        backend::adopt_preview(status.preview.as_ref());
+    /// Take new profile/startup metadata without replacing an edited draft.
+    fn replace_status(&mut self, status: backend::Status) {
         self.status = status;
+        self.sync_preview_clock(Instant::now());
         self.clamp_scrolls();
         if self.selected >= self.draft.len() {
             self.selected = self.draft.len().saturating_sub(1);
         }
-        Ok(())
     }
 
     fn clamp_scrolls(&mut self) {
@@ -833,15 +1135,14 @@ impl State {
             self.dirty = true;
         }
         let profile = self.profile_from_draft();
-        backend::preview(&profile, 15)?;
-        self.dirty = false;
-        self.had_preview = true;
-        self.preview_layout = Some(self.draft.clone());
-        self.set_message(
-            "Previewing for 15 s. Keep the result or let it revert.",
-            false,
+        let layout = self.draft.clone();
+        self.submit(
+            backend::Job::Preview {
+                profile,
+                seconds: PREVIEW_SECONDS,
+            },
+            After::Preview { layout },
         );
-        let _ = self.reload(false);
         Ok(())
     }
 
@@ -851,27 +1152,18 @@ impl State {
                 "The draft changed after the preview; press Preview again to apply it.".into(),
             );
         }
-        backend::keep()?;
-        self.dirty = false;
-        self.had_preview = false;
-        self.preview_layout = None;
-        self.set_message("Display layout kept.", false);
-        let _ = self.reload(true);
+        self.submit(backend::Job::Keep, After::Keep { quit: false });
         Ok(())
     }
 
     pub fn revert(&mut self) -> Result<(), String> {
-        backend::revert()?;
-        self.dirty = false;
-        self.had_preview = false;
-        self.preview_layout = None;
-        self.set_message("Previous layout restored.", false);
-        let _ = self.reload(true);
+        self.submit(backend::Job::Revert, After::Revert { quit: false });
         Ok(())
     }
 
     pub fn save(&mut self, name: &str) -> Result<(), String> {
-        if name.trim().is_empty() {
+        let name = name.trim();
+        if name.is_empty() {
             return Err("a profile name is required".into());
         }
         let issues = validate_draft(&self.draft);
@@ -882,19 +1174,18 @@ impl State {
             self.dirty = true;
         }
         let mut profile = self.profile_from_draft();
-        profile.name = name.trim().to_string();
-        backend::save_profile(&profile, name.trim())?;
-        self.set_message(format!("Saved display profile {}.", name.trim()), false);
-        self.refresh_profiles()?;
-        self.refresh_dirty_from_status();
-        self.selected_profile = self
-            .status
-            .profiles
-            .iter()
-            .position(|profile| profile.name == name.trim());
-        if let Some(index) = self.selected_profile {
-            self.profile_scroll = index / PROFILE_PAGE;
-        }
+        profile.name = name.to_string();
+        let update = self.status.profiles.iter().any(|p| p.name == name);
+        self.submit(
+            backend::Job::Save {
+                profile,
+                name: name.to_string(),
+            },
+            After::Save {
+                name: name.to_string(),
+                update,
+            },
+        );
         Ok(())
     }
 
@@ -908,26 +1199,42 @@ impl State {
             .get(index)
             .map(|profile| profile.name.clone())
             .ok_or("unknown display profile")?;
-        backend::rename_profile(&old, new.trim())?;
-        self.refresh_profiles()?;
-        self.selected_profile = self
-            .status
-            .profiles
-            .iter()
-            .position(|profile| profile.name == new.trim());
-        if let Some(index) = self.selected_profile {
-            self.profile_scroll = index / PROFILE_PAGE;
-        }
-        self.set_message(format!("Renamed {old} to {}.", new.trim()), false);
+        let new = new.trim().to_string();
+        self.submit(
+            backend::Job::Rename {
+                old: old.clone(),
+                new: new.clone(),
+            },
+            After::Rename { old, new },
+        );
         Ok(())
     }
 
     pub fn delete_named(&mut self, name: &str) -> Result<(), String> {
-        backend::delete_profile(name)?;
-        self.refresh_profiles()?;
-        self.refresh_dirty_from_status();
-        self.selected_profile = None;
-        self.set_message(format!("Deleted display profile {name}."), false);
+        self.submit(
+            backend::Job::Delete {
+                name: name.to_string(),
+            },
+            After::Delete {
+                name: name.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Toggle "Use at login" for the selected profile.
+    pub fn toggle_startup(&mut self) -> Result<(), String> {
+        let name = self
+            .selected_profile
+            .and_then(|index| self.status.profiles.get(index))
+            .map(|profile| profile.name.clone())
+            .ok_or("Select a saved profile first.")?;
+        let next = (self.status.startup_profile.as_deref() != Some(name.as_str())).then_some(name);
+        let enabled = next.is_some();
+        self.submit(
+            backend::Job::Startup { name: next },
+            After::Startup { enabled },
+        );
         Ok(())
     }
 }
@@ -1825,6 +2132,8 @@ pub struct App {
     pub palette: theme::Palette,
     font: text::Font,
     keys: keyboard::Keys,
+    /// RandR change notifications are selected on the root window.
+    randr: bool,
     wm_protocols: Atom,
     wm_delete_window: Atom,
     drag: Option<Drag>,
@@ -1957,6 +2266,22 @@ impl App {
         )
         .map_err(|e| e.to_string())?;
         let cursors = load_cursors(&c);
+        // D1: hotplug and layout changes arrive as RandR events instead of
+        // a status read (and an xrandr reprobe) every two seconds.
+        let randr = c
+            .randr_query_version(1, 3)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_some()
+            && c.randr_select_input(
+                root,
+                randr::NotifyMask::SCREEN_CHANGE
+                    | randr::NotifyMask::OUTPUT_CHANGE
+                    | randr::NotifyMask::CRTC_CHANGE
+                    | randr::NotifyMask::OUTPUT_PROPERTY,
+            )
+            .map(|cookie| cookie.check().is_ok())
+            .unwrap_or(false);
         c.map_window(win).map_err(|e| e.to_string())?;
         c.sync().map_err(|e| e.to_string())?;
         Ok(Self {
@@ -1972,6 +2297,7 @@ impl App {
             palette,
             font,
             keys,
+            randr,
             wm_protocols,
             wm_delete_window,
             drag: None,
@@ -1984,6 +2310,78 @@ impl App {
             overlays: Vec::new(),
             identify_until: None,
         })
+    }
+
+    /// The layout of everything at the window's current size and view.
+    fn ui(&self, state: &State) -> Ui {
+        Ui::new(
+            state,
+            self.w,
+            self.h,
+            self.drag.as_ref().map(|drag| drag.canvas),
+            self.zoom,
+            self.pan,
+        )
+    }
+
+    /// The RandR fingerprint (see `watch::Stamps`), read without probing
+    /// the outputs: `GetScreenResourcesCurrent` and the CRTC and output
+    /// details at its configuration time.
+    fn stamps(&self) -> Option<watch::Stamps> {
+        use std::hash::{Hash, Hasher};
+        if !self.randr {
+            return None;
+        }
+        let res = self
+            .c
+            .randr_get_screen_resources_current(self.root)
+            .ok()?
+            .reply()
+            .ok()?;
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (res.timestamp, res.config_timestamp).hash(&mut hash);
+        if let Some(geometry) = self
+            .c
+            .get_geometry(self.root)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+        {
+            (geometry.width, geometry.height).hash(&mut hash);
+        }
+        let crtcs: Vec<_> = res
+            .crtcs
+            .iter()
+            .filter_map(|crtc| self.c.randr_get_crtc_info(*crtc, res.config_timestamp).ok())
+            .collect();
+        for cookie in crtcs {
+            if let Ok(info) = cookie.reply() {
+                (
+                    info.x,
+                    info.y,
+                    info.width,
+                    info.height,
+                    info.mode,
+                    u16::from(info.rotation),
+                    info.outputs,
+                )
+                    .hash(&mut hash);
+            }
+        }
+        let outputs: Vec<_> = res
+            .outputs
+            .iter()
+            .filter_map(|output| {
+                self.c
+                    .randr_get_output_info(*output, res.config_timestamp)
+                    .ok()
+            })
+            .collect();
+        for cookie in outputs {
+            if let Ok(info) = cookie.reply() {
+                (u8::from(info.connection), info.crtc, info.modes).hash(&mut hash);
+            }
+        }
+        Some(hash.finish())
     }
 
     fn resize_backing(&mut self) -> Result<(), String> {
@@ -2580,11 +2978,11 @@ impl App {
                 12.0,
             )?;
         }
-        if let Some(preview) = &state.status.preview {
+        if let Some(left) = state.preview_seconds_left(Instant::now()) {
             self.label_right(
                 i16::try_from(self.w).unwrap_or(i16::MAX) - PAD,
                 PAD - 4,
-                &format!("Preview {} s", preview.seconds_left),
+                &format!("Preview {left} s"),
                 self.palette.accent,
                 13.0,
             )?;
@@ -3182,10 +3580,8 @@ impl App {
             &format!(
                 "Keep{}",
                 state
-                    .status
-                    .preview
-                    .as_ref()
-                    .map(|preview| format!(" ({}s)", preview.seconds_left))
+                    .preview_seconds_left(Instant::now())
+                    .map(|left| format!(" ({left}s)"))
                     .unwrap_or_default()
             ),
             state.preview_active(),
@@ -3433,7 +3829,7 @@ impl App {
         let blocking = issues.iter().find(|issue| issue.blocking);
         let warning = issues.iter().find(|issue| !issue.blocking);
         let (message, colour) = if state.busy {
-            ("Applying…".to_string(), self.palette.muted)
+            (state.busy_text.to_string(), self.palette.muted)
         } else if state.message_is_error {
             (state.message.clone(), self.palette.error())
         } else if let Some(issue) = blocking {
@@ -3485,11 +3881,6 @@ impl App {
             .map_err(|e| e.to_string())?;
         self.c.flush().map_err(|e| e.to_string())
     }
-
-    fn refresh(&self, state: &State, ui: &Ui, help: bool) -> Result<(), String> {
-        self.paint(state, ui, help)?;
-        self.flush()
-    }
 }
 
 fn load_cursors(c: &RustConnection) -> Option<Cursors> {
@@ -3512,421 +3903,568 @@ fn load_cursors(c: &RustConnection) -> Option<Cursors> {
     })
 }
 
-fn wait_for_input(app: &App) -> Result<(), String> {
-    use std::os::unix::io::AsRawFd;
-    let fd = app.c.stream().as_raw_fd();
-    let mut poll = libc::pollfd {
-        fd,
-        events: libc::POLLIN,
-        revents: 0,
+/// Wait until the X socket, the worker's wake pipe or the file watcher has
+/// something, or until `timeout` (`None`: no timeout at all).
+fn wait_for_input(fds: &[libc::c_int], timeout: Option<Duration>) {
+    let mut polls: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|fd| libc::pollfd {
+            fd: *fd,
+            events: libc::POLLIN,
+            revents: 0,
+        })
+        .collect();
+    let ms = timeout
+        .map(|t| t.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32)
+        .unwrap_or(-1);
+    // SAFETY: a live array of pollfd structures and its length.
+    let _ = unsafe { libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, ms) };
+}
+
+/// How often a running preview's status is read again, to notice a Keep or
+/// Revert made elsewhere when the layout itself does not change.
+const PREVIEW_RECHECK: Duration = Duration::from_secs(5);
+/// How long after the local preview deadline the window looks again, so the
+/// watchdog has had time to restore the previous layout.
+const PREVIEW_GRACE: Duration = Duration::from_millis(700);
+
+/// The event loop's bookkeeping outside the window and the draft.
+struct Loop {
+    help: bool,
+    dirty: bool,
+    /// RandR events, debounced into one stamp check.
+    randr: watch::Debounce,
+    /// A debounced RandR event waits for the stamp check.
+    randr_check: bool,
+    /// inotify events on the profile or preview file, debounced.
+    files: watch::Debounce,
+    /// The display files as the last status read saw them.
+    file_stamps: [watch::FileStamp; 2],
+    /// A status read that does not depend on the RandR stamps is due.
+    reload_due: bool,
+    /// A background status read is on the worker.
+    background: bool,
+    /// The palette must be read again before the next paint.
+    theme: bool,
+    last_preview_read: Instant,
+    expiry_checked: bool,
+    next_tick: Option<Instant>,
+}
+
+impl Loop {
+    fn new() -> Self {
+        Self {
+            help: false,
+            dirty: true,
+            randr: watch::Debounce::default(),
+            randr_check: false,
+            files: watch::Debounce::default(),
+            file_stamps: display_file_stamps(),
+            reload_due: false,
+            background: false,
+            theme: false,
+            last_preview_read: Instant::now(),
+            expiry_checked: false,
+            next_tick: None,
+        }
+    }
+
+    /// How long the loop may sleep: until the next debounce, the identify
+    /// overlay's end or the preview's next second, or forever.
+    fn timeout(&self, app: &App, state: &State, now: Instant) -> Option<Duration> {
+        let mut at: Vec<Instant> = Vec::new();
+        for debounce in [&self.randr, &self.files] {
+            if let Some(left) = debounce.timeout(now) {
+                at.push(now + left);
+            }
+        }
+        if let Some(until) = app.identify_until {
+            at.push(until);
+        }
+        if state.preview_active() {
+            if let Some(tick) = self.next_tick {
+                at.push(tick);
+            }
+            at.push(self.last_preview_read + PREVIEW_RECHECK);
+            if let Some(deadline) = state.preview_deadline() {
+                if !self.expiry_checked {
+                    at.push(deadline + PREVIEW_GRACE);
+                }
+            }
+        }
+        at.into_iter()
+            .min()
+            .map(|when| when.saturating_duration_since(now))
+    }
+}
+
+fn display_file_stamps() -> [watch::FileStamp; 2] {
+    watch::display_files().map(|path| watch::file_stamp(&path))
+}
+
+/// The time of the preview countdown's next whole second.
+fn next_second(deadline: Instant, now: Instant) -> Instant {
+    let left = deadline.saturating_duration_since(now);
+    let fraction = Duration::from_nanos((left.as_nanos() % 1_000_000_000) as u64);
+    let step = if fraction.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        fraction
     };
-    // SAFETY: one pollfd describing the live X socket is passed.
-    let _ = unsafe { libc::poll(&mut poll, 1, 250) };
-    Ok(())
+    now + step
 }
 
 pub fn run(app: &mut App, state: &mut State) -> Result<(), String> {
-    let mut help = false;
-    let mut dirty = true;
-    let mut last_refresh = Instant::now();
+    use std::os::unix::io::AsRawFd;
+    let wake = std::sync::Arc::new(watch::Wake::new()?);
+    let mut worker: backend::Worker<After> = {
+        let wake = wake.clone();
+        backend::Worker::start(move || wake.notify())
+    };
+    let mut watcher = watch::Watcher::new().ok();
+    if let Some(watcher) = watcher.as_mut() {
+        watcher.set(watch::watched_dirs());
+    }
+    let mut guard = watch::StampGuard::default();
+    guard.record(app.stamps());
+    let mut lp = Loop::new();
     let mut last_theme = Instant::now();
-    'outer: loop {
-        let mut handled = false;
-        while let Some(event) = app.c.poll_for_event().map_err(|e| e.to_string())? {
-            handled = true;
-            if !matches!(event, Event::NoExposure(_)) {
-                dirty = true;
+    let mut pending: Option<Event> = None;
+    loop {
+        // 1. Every X event that is queued.
+        loop {
+            let event = match pending.take() {
+                Some(event) => event,
+                None => match app.c.poll_for_event().map_err(|e| e.to_string())? {
+                    Some(event) => event,
+                    None => break,
+                },
+            };
+            handle_event(app, state, &mut lp, event)?;
+        }
+        // 2. Answers from the worker.
+        wake.drain();
+        while let Some(done) = worker.try_recv() {
+            if done.after.background() {
+                lp.background = false;
             }
-            match event {
-                Event::Expose(e) if e.count != 0 => {}
-                Event::ConfigureNotify(e) => {
-                    if e.width != app.w || e.height != app.h {
-                        app.w = e.width.max(MIN_WIDTH);
-                        app.h = e.height.max(MIN_HEIGHT);
-                        app.resize_backing()?;
-                    }
+            let read = done.status.is_ok();
+            state.finish(done);
+            if read {
+                // Recorded after the read, so the reprobe that niructl's
+                // xrandr call made cannot look like a change.
+                guard.record(app.stamps());
+                lp.file_stamps = display_file_stamps();
+                lp.last_preview_read = Instant::now();
+                lp.expiry_checked = false;
+            }
+            lp.dirty = true;
+        }
+        // 3. Files niructl writes, and the theme.
+        if let Some(watcher) = watcher.as_mut() {
+            let changes = watcher.drain();
+            if changes.theme {
+                lp.theme = true;
+                lp.dirty = true;
+            }
+            if changes.display {
+                lp.files.note(Instant::now());
+            }
+            watcher.set(watch::watched_dirs());
+        }
+        // 4. Debounces and the preview clock.
+        let now = Instant::now();
+        if lp.randr.take(now) {
+            lp.randr_check = true;
+        }
+        if lp.files.take(now) && display_file_stamps() != lp.file_stamps {
+            lp.reload_due = true;
+        }
+        if state.preview_active() {
+            if now >= lp.last_preview_read + PREVIEW_RECHECK {
+                lp.reload_due = true;
+            }
+            if let Some(deadline) = state.preview_deadline() {
+                if !lp.expiry_checked && now >= deadline + PREVIEW_GRACE {
+                    lp.expiry_checked = true;
+                    lp.reload_due = true;
                 }
-                Event::MappingNotify(_) => {
-                    // setxkbmap and every other keymap change: read the
-                    // whole table again so Shift and AltGr stay right.
-                    if let Ok(keys) = keyboard::Keys::load(&app.c) {
-                        app.keys = keys;
-                    }
+                if lp.next_tick.is_none_or(|tick| now >= tick) {
+                    lp.next_tick = Some(next_second(deadline, now));
+                    lp.dirty = true;
                 }
-                Event::KeyPress(e) => {
-                    // Shortcuts compare against the key's base symbol, text
-                    // against the symbol of the active level.
-                    let key = match app.keys.base(e.detail) {
-                        K_KP_ENTER => K_RETURN,
-                        key => key,
-                    };
-                    let typed = keyboard::text_char(app.keys.sym(e.detail, e.state));
-                    let shift = e.state.contains(KeyButMask::SHIFT);
-                    let ctrl = e.state.contains(KeyButMask::CONTROL);
-                    if state.name_mode.is_some() {
-                        match key {
-                            K_ESCAPE => {
-                                state.name_mode = None;
-                                state.name_text.clear();
-                                state.focus = None;
-                            }
-                            K_BACKSPACE => {
-                                state.name_text.pop();
-                            }
-                            K_RETURN => {
-                                let action = state.name_mode.take();
-                                let text = state.name_text.trim().to_string();
-                                state.name_text.clear();
-                                state.focus = None;
-                                let result = match action {
-                                    Some(NameAction::Save) => {
-                                        let ui =
-                                            Ui::new(state, app.w, app.h, None, app.zoom, app.pan);
-                                        state.busy = true;
-                                        let _ = app.refresh(state, &ui, help);
-                                        let result = state.save(&text);
-                                        state.busy = false;
-                                        result
-                                    }
-                                    Some(NameAction::Rename) => state.rename(&text),
-                                    None => Ok(()),
-                                };
-                                if let Err(err) = result {
-                                    state.set_message(err, true);
-                                }
-                                dirty = true;
-                            }
-                            _ => {
-                                if let Some(ch) = typed {
-                                    if state.name_text.chars().count() < 64 {
-                                        state.name_text.push(ch);
-                                    }
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    if state.confirm.is_some() {
-                        match key {
-                            K_ESCAPE | K_N => {
-                                state.confirm = None;
-                            }
-                            K_RETURN | K_Y => {
-                                confirm_action(app, state, help)?;
-                            }
-                            _ => {}
-                        }
-                        continue;
-                    }
-                    if help {
-                        help = false;
-                        continue;
-                    }
-                    if key == K_ESCAPE {
-                        if app.drag.is_some() {
-                            cancel_drag(app, state);
-                        } else if state.focus.is_some() {
-                            state.focus = None;
-                        } else {
-                            request_close(state);
-                        }
-                        continue;
-                    }
-                    if key == K_Q {
-                        request_close(state);
-                        continue;
-                    }
-                    if key == K_F1 {
-                        help = true;
-                        continue;
-                    }
-                    if ctrl && key == K_Z {
-                        state.undo();
-                        continue;
-                    }
-                    if key == K_I && !ctrl {
-                        if let Err(err) = app.identify(state) {
-                            state.set_message(err, true);
-                        }
-                        continue;
-                    }
-                    if key == K_R && !ctrl {
-                        if let Err(err) = state.reload(true) {
-                            state.set_message(err, true);
-                        }
-                        dirty = true;
-                        continue;
-                    }
-                    if key == K_0 && !ctrl {
-                        app.zoom = 1.0;
-                        app.pan = (0.0, 0.0);
-                        state.set_message("Canvas zoom reset.", false);
-                        continue;
-                    }
-                    if key == K_TAB {
-                        let ui = Ui::new(
-                            state,
-                            app.w,
-                            app.h,
-                            app.drag.as_ref().map(|drag| drag.canvas),
-                            app.zoom,
-                            app.pan,
-                        );
-                        let order = focus_order(&ui);
-                        if order.is_empty() {
-                            continue;
-                        }
-                        let current = state
-                            .focus
-                            .and_then(|focus| order.iter().position(|hit| *hit == focus));
-                        let next = match current {
-                            Some(index) if shift => (index + order.len() - 1) % order.len(),
-                            Some(index) => (index + 1) % order.len(),
-                            None if shift => order.len().saturating_sub(1),
-                            None => 0,
-                        };
-                        state.focus = order.get(next).copied();
-                        continue;
-                    }
-                    if matches!(key, K_PAGEUP | K_PAGEDOWN) {
-                        let ui = Ui::new(
-                            state,
-                            app.w,
-                            app.h,
-                            app.drag.as_ref().map(|drag| drag.canvas),
-                            app.zoom,
-                            app.pan,
-                        );
-                        page_outputs(state, &ui, if key == K_PAGEUP { -1 } else { 1 });
-                        continue;
-                    }
-                    if matches!(key, K_LEFT | K_RIGHT | K_UP | K_DOWN) {
-                        let step = if shift { 10 } else { 1 };
-                        let ui = Ui::new(
-                            state,
-                            app.w,
-                            app.h,
-                            app.drag.as_ref().map(|drag| drag.canvas),
-                            app.zoom,
-                            app.pan,
-                        );
-                        handle_arrows(state, &ui, key, step);
-                        continue;
-                    }
-                    if key == K_RETURN || key == K_SPACE {
-                        if let Some(focus) = state.focus {
-                            let ui = Ui::new(
-                                state,
-                                app.w,
-                                app.h,
-                                app.drag.as_ref().map(|drag| drag.canvas),
-                                app.zoom,
-                                app.pan,
-                            );
-                            activate(app, state, &ui, focus, help)?;
-                        } else if key == K_RETURN {
-                            let ui = Ui::new(state, app.w, app.h, None, app.zoom, app.pan);
-                            state.busy = true;
-                            let _ = app.refresh(state, &ui, help);
-                            if let Err(err) = state.apply_preview() {
-                                state.set_message(err, true);
-                            }
-                            state.busy = false;
-                        }
-                        continue;
-                    }
-                }
-                Event::ButtonPress(e) => {
-                    if state.name_mode.is_some() {
-                        continue;
-                    }
-                    if state.confirm.is_some() {
-                        let (yes, no) = confirm_buttons(app.w, app.h);
-                        if e.detail == 1 && contains(yes, e.event_x, e.event_y) {
-                            confirm_action(app, state, help)?;
-                        } else if e.detail == 1 && contains(no, e.event_x, e.event_y) {
-                            state.confirm = None;
-                        }
-                        continue;
-                    }
-                    let ui = Ui::new(
-                        state,
-                        app.w,
-                        app.h,
-                        app.drag.as_ref().map(|drag| drag.canvas),
-                        app.zoom,
-                        app.pan,
-                    );
-                    if e.detail == 4 || e.detail == 5 {
-                        if contains(ui.l.profiles, e.event_x, e.event_y) {
-                            page_profiles(state, &ui, if e.detail == 4 { -1 } else { 1 });
-                        } else if contains(ui.l.panel, e.event_x, e.event_y) {
-                            page_outputs(state, &ui, if e.detail == 4 { -1 } else { 1 });
-                        } else if contains(ui.l.canvas, e.event_x, e.event_y) {
-                            app.zoom = if e.detail == 4 {
-                                (app.zoom * 1.1).min(4.0)
-                            } else {
-                                (app.zoom / 1.1).max(0.5)
-                            };
-                            if (app.zoom - 1.0).abs() < 0.001 {
-                                app.zoom = 1.0;
-                                app.pan = (0.0, 0.0);
-                            }
-                        }
-                        continue;
-                    }
-                    if e.detail == 2 && contains(ui.l.canvas, e.event_x, e.event_y) {
-                        app.pan_drag = Some((e.event_x, e.event_y, app.pan.0, app.pan.1));
-                        continue;
-                    }
-                    state.focus = None;
-                    if e.detail != 1 {
-                        continue;
-                    }
-                    if let Some(Hit::Monitor(index)) = hit(state, &ui, e.event_x, e.event_y) {
-                        state.selected = index;
-                        let group = state.mirror_group(index);
-                        let start_positions = group
-                            .iter()
-                            .filter_map(|candidate| {
-                                state
-                                    .draft
-                                    .get(*candidate)
-                                    .map(|output| (*candidate, output.x, output.y))
-                            })
-                            .collect();
-                        app.drag = Some(Drag {
-                            group,
-                            start_mouse: (e.event_x, e.event_y),
-                            start_positions,
-                            canvas: ui.canvas,
-                            moved: false,
-                            was_dirty: state.dirty,
-                            guide_x: None,
-                            guide_y: None,
-                        });
-                        continue;
-                    }
-                    if let Some(action) = hit(state, &ui, e.event_x, e.event_y) {
-                        activate(app, state, &ui, action, help)?;
-                    }
-                }
-                Event::ButtonRelease(_) => {
-                    app.pan_drag = None;
-                    finish_drag(app, state);
-                }
-                Event::MotionNotify(e) => {
-                    if let Some((start_x, start_y, pan_x, pan_y)) = app.pan_drag {
-                        app.pan = (
-                            pan_x + f32::from(e.event_x - start_x),
-                            pan_y + f32::from(e.event_y - start_y),
-                        );
-                        dirty = true;
-                        continue;
-                    }
-                    if app.drag.is_some() {
-                        if !e.state.contains(KeyButMask::BUTTON1) {
-                            finish_drag(app, state);
-                            continue;
-                        }
-                        let mouse = (e.event_x, e.event_y);
-                        drag_motion(state, app, mouse);
-                        continue;
-                    }
-                    let ui = Ui::new(state, app.w, app.h, None, app.zoom, app.pan);
-                    let hover = hit(state, &ui, e.event_x, e.event_y);
-                    if hover != app.hover {
-                        app.hover = hover;
-                        let cursor = app.cursors.map(|cursors| match hover {
-                            Some(Hit::Monitor(_)) => cursors.fleur,
-                            Some(Hit::Output(_))
-                            | Some(Hit::OutputPrev)
-                            | Some(Hit::OutputNext)
-                            | Some(Hit::Primary)
-                            | Some(Hit::Enabled)
-                            | Some(Hit::Rotate)
-                            | Some(Hit::Identify)
-                            | Some(Hit::ModePrev)
-                            | Some(Hit::ModeNext)
-                            | Some(Hit::RatePrev)
-                            | Some(Hit::RateNext)
-                            | Some(Hit::Single)
-                            | Some(Hit::Extend)
-                            | Some(Hit::Mirror)
-                            | Some(Hit::Apply)
-                            | Some(Hit::Keep)
-                            | Some(Hit::Revert)
-                            | Some(Hit::Save)
-                            | Some(Hit::Rename)
-                            | Some(Hit::Delete)
-                            | Some(Hit::Startup)
-                            | Some(Hit::Reload)
-                            | Some(Hit::Profile(_))
-                            | Some(Hit::ProfilePrev)
-                            | Some(Hit::ProfileNext) => cursors.hand,
-                            _ => cursors.normal,
-                        });
-                        app.set_cursor(cursor)?;
-                        dirty = true;
-                    }
-                }
-                Event::ClientMessage(e)
-                    if is_close_request(&e, app.wm_protocols, app.wm_delete_window) =>
-                {
-                    request_close(state);
-                }
-                _ => {}
+            }
+        } else {
+            lp.next_tick = None;
+        }
+        // 5. One background status read at a time, never during a drag
+        // (the drag holds output indices) and never behind an action, whose
+        // own status read answers the same question.
+        if !lp.background && !state.busy && state.outbox.is_empty() && app.drag.is_none() {
+            let randr_changed = lp.randr_check && guard.changed(app.stamps());
+            lp.randr_check = false;
+            if lp.reload_due || randr_changed {
+                lp.reload_due = false;
+                lp.background = true;
+                lp.last_preview_read = now;
+                state.submit(
+                    backend::Job::Status,
+                    After::Reload {
+                        forced: false,
+                        background: true,
+                    },
+                );
             }
         }
+        for (job, after) in state.outbox.drain(..) {
+            worker.submit(job, after);
+        }
         if state.quit {
-            break 'outer;
+            break;
         }
         if let Some(until) = app.identify_until {
             if Instant::now() >= until {
                 let _ = app.clear_identify();
+                lp.dirty = true;
             }
         }
-        let interval = if state.preview_active() {
-            Duration::from_secs(1)
-        } else {
-            Duration::from_secs(2)
-        };
-        if last_refresh.elapsed() >= interval
-            && state.name_mode.is_none()
-            && state.confirm.is_none()
-            && app.drag.is_none()
-        {
-            last_refresh = Instant::now();
-            if let Err(err) = state.reload(false) {
-                state.set_message(err, true);
-            }
-            dirty = true;
-        }
-        if dirty {
-            if last_theme.elapsed() >= Duration::from_millis(750) {
+        // 6. Paint.
+        if lp.dirty {
+            // Without inotify the palette is read again on repaints, at most
+            // every 750 ms, as before.
+            if lp.theme || (watcher.is_none() && last_theme.elapsed() >= Duration::from_millis(750))
+            {
                 app.palette = theme::load();
                 last_theme = Instant::now();
+                lp.theme = false;
             }
-            let ui = Ui::new(
-                state,
-                app.w,
-                app.h,
-                app.drag.as_ref().map(|drag| drag.canvas),
-                app.zoom,
-                app.pan,
-            );
-            app.paint(state, &ui, help)?;
+            let ui = app.ui(state);
+            app.paint(state, &ui, lp.help)?;
             app.flush()?;
-            dirty = false;
+            lp.dirty = false;
         } else {
             app.c.flush().map_err(|e| e.to_string())?;
         }
-        if !handled {
-            wait_for_input(app)?;
+        // 7. Sleep until something happens. Replies read while painting may
+        // have queued events that poll(2) would not see.
+        if let Some(event) = app.c.poll_for_event().map_err(|e| e.to_string())? {
+            pending = Some(event);
+            continue;
         }
+        let mut fds = vec![app.c.stream().as_raw_fd(), wake.fd()];
+        if let Some(watcher) = watcher.as_ref() {
+            fds.push(watcher.fd());
+        }
+        wait_for_input(&fds, lp.timeout(app, state, Instant::now()));
     }
-    if state.preview_active() {
+    if state.preview_active() && !state.busy {
         let _ = backend::revert();
+    }
+    Ok(())
+}
+
+fn handle_event(
+    app: &mut App,
+    state: &mut State,
+    lp: &mut Loop,
+    event: Event,
+) -> Result<(), String> {
+    if !matches!(
+        event,
+        Event::NoExposure(_)
+            | Event::MotionNotify(_)
+            | Event::MappingNotify(_)
+            | Event::RandrScreenChangeNotify(_)
+            | Event::RandrNotify(_)
+    ) {
+        lp.dirty = true;
+    }
+    let help = lp.help;
+    match event {
+        Event::Expose(e) if e.count != 0 => {}
+        Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
+            // A hotplug, a mode change or a property update. The stamp
+            // check after the debounce decides whether it is news.
+            lp.randr.note(Instant::now());
+        }
+        Event::ConfigureNotify(e) => {
+            if e.width != app.w || e.height != app.h {
+                app.w = e.width.max(MIN_WIDTH);
+                app.h = e.height.max(MIN_HEIGHT);
+                app.resize_backing()?;
+            }
+        }
+        Event::MappingNotify(_) => {
+            // setxkbmap and every other keymap change: read the whole
+            // table again so Shift and AltGr stay right.
+            if let Ok(keys) = keyboard::Keys::load(&app.c) {
+                app.keys = keys;
+            }
+        }
+        Event::KeyPress(e) => {
+            // Shortcuts compare against the key's base symbol, text against
+            // the symbol of the active level.
+            let key = match app.keys.base(e.detail) {
+                K_KP_ENTER => K_RETURN,
+                key => key,
+            };
+            let typed = keyboard::text_char(app.keys.sym(e.detail, e.state));
+            let shift = e.state.contains(KeyButMask::SHIFT);
+            let ctrl = e.state.contains(KeyButMask::CONTROL);
+            if state.busy {
+                // While an action runs only Esc is accepted: it closes the
+                // window at once. niructl finishes the action on its own,
+                // and a preview stays under its watchdog.
+                if key == K_ESCAPE {
+                    state.quit = true;
+                }
+                return Ok(());
+            }
+            if state.name_mode.is_some() {
+                match key {
+                    K_ESCAPE => {
+                        state.name_mode = None;
+                        state.name_text.clear();
+                        state.focus = None;
+                    }
+                    K_BACKSPACE => {
+                        state.name_text.pop();
+                    }
+                    K_RETURN => {
+                        let action = state.name_mode.take();
+                        let text = state.name_text.trim().to_string();
+                        state.name_text.clear();
+                        state.focus = None;
+                        let result = match action {
+                            Some(NameAction::Save) => state.save(&text),
+                            Some(NameAction::Rename) => state.rename(&text),
+                            None => Ok(()),
+                        };
+                        if let Err(err) = result {
+                            state.set_message(err, true);
+                        }
+                    }
+                    _ => {
+                        if let Some(ch) = typed {
+                            if !ctrl && state.name_text.chars().count() < 64 {
+                                state.name_text.push(ch);
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            if state.confirm.is_some() {
+                match key {
+                    K_ESCAPE | K_N => {
+                        state.confirm = None;
+                    }
+                    K_RETURN | K_Y => {
+                        confirm_action(app, state, help)?;
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            if lp.help {
+                lp.help = false;
+                return Ok(());
+            }
+            if key == K_ESCAPE {
+                if app.drag.is_some() {
+                    cancel_drag(app, state);
+                } else if state.focus.is_some() {
+                    state.focus = None;
+                } else {
+                    request_close(state);
+                }
+                return Ok(());
+            }
+            if key == K_Q {
+                request_close(state);
+                return Ok(());
+            }
+            if key == K_F1 {
+                lp.help = true;
+                return Ok(());
+            }
+            if ctrl && key == K_Z {
+                state.undo();
+                return Ok(());
+            }
+            if ctrl && key == K_S {
+                let ui = app.ui(state);
+                activate(app, state, &ui, Hit::Save)?;
+                return Ok(());
+            }
+            if key == K_I && !ctrl {
+                if let Err(err) = app.identify(state) {
+                    state.set_message(err, true);
+                }
+                return Ok(());
+            }
+            if key == K_R && !ctrl {
+                state.request_reload(true);
+                return Ok(());
+            }
+            if key == K_0 && !ctrl {
+                app.zoom = 1.0;
+                app.pan = (0.0, 0.0);
+                state.set_message("Canvas zoom reset.", false);
+                return Ok(());
+            }
+            if key == K_TAB {
+                let ui = app.ui(state);
+                let order = focus_order(&ui);
+                if order.is_empty() {
+                    return Ok(());
+                }
+                let current = state
+                    .focus
+                    .and_then(|focus| order.iter().position(|hit| *hit == focus));
+                let next = match current {
+                    Some(index) if shift => (index + order.len() - 1) % order.len(),
+                    Some(index) => (index + 1) % order.len(),
+                    None if shift => order.len().saturating_sub(1),
+                    None => 0,
+                };
+                state.focus = order.get(next).copied();
+                return Ok(());
+            }
+            if matches!(key, K_PAGEUP | K_PAGEDOWN) {
+                let ui = app.ui(state);
+                page_outputs(state, &ui, if key == K_PAGEUP { -1 } else { 1 });
+                return Ok(());
+            }
+            if matches!(key, K_LEFT | K_RIGHT | K_UP | K_DOWN) {
+                let step = if shift { 10 } else { 1 };
+                let ui = app.ui(state);
+                handle_arrows(state, &ui, key, step);
+                return Ok(());
+            }
+            if key == K_RETURN || key == K_SPACE {
+                if let Some(focus) = state.focus {
+                    let ui = app.ui(state);
+                    activate(app, state, &ui, focus)?;
+                } else if key == K_RETURN {
+                    if let Err(err) = state.apply_preview() {
+                        state.set_message(err, true);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        Event::ButtonPress(e) => {
+            if state.busy || state.name_mode.is_some() {
+                return Ok(());
+            }
+            if state.confirm.is_some() {
+                let (yes, no) = confirm_buttons(app.w, app.h);
+                if e.detail == 1 && contains(yes, e.event_x, e.event_y) {
+                    confirm_action(app, state, help)?;
+                } else if e.detail == 1 && contains(no, e.event_x, e.event_y) {
+                    state.confirm = None;
+                }
+                return Ok(());
+            }
+            let ui = app.ui(state);
+            if e.detail == 4 || e.detail == 5 {
+                if contains(ui.l.profiles, e.event_x, e.event_y) {
+                    page_profiles(state, &ui, if e.detail == 4 { -1 } else { 1 });
+                } else if contains(ui.l.panel, e.event_x, e.event_y) {
+                    page_outputs(state, &ui, if e.detail == 4 { -1 } else { 1 });
+                } else if contains(ui.l.canvas, e.event_x, e.event_y) {
+                    app.zoom = if e.detail == 4 {
+                        (app.zoom * 1.1).min(4.0)
+                    } else {
+                        (app.zoom / 1.1).max(0.5)
+                    };
+                    if (app.zoom - 1.0).abs() < 0.001 {
+                        app.zoom = 1.0;
+                        app.pan = (0.0, 0.0);
+                    }
+                }
+                return Ok(());
+            }
+            if e.detail == 2 && contains(ui.l.canvas, e.event_x, e.event_y) {
+                app.pan_drag = Some((e.event_x, e.event_y, app.pan.0, app.pan.1));
+                return Ok(());
+            }
+            state.focus = None;
+            if e.detail != 1 {
+                return Ok(());
+            }
+            if let Some(Hit::Monitor(index)) = hit(state, &ui, e.event_x, e.event_y) {
+                state.selected = index;
+                let group = state.mirror_group(index);
+                let start_positions = group
+                    .iter()
+                    .filter_map(|candidate| {
+                        state
+                            .draft
+                            .get(*candidate)
+                            .map(|output| (*candidate, output.x, output.y))
+                    })
+                    .collect();
+                app.drag = Some(Drag {
+                    group,
+                    start_mouse: (e.event_x, e.event_y),
+                    start_positions,
+                    canvas: ui.canvas,
+                    moved: false,
+                    was_dirty: state.dirty,
+                    guide_x: None,
+                    guide_y: None,
+                });
+                return Ok(());
+            }
+            if let Some(action) = hit(state, &ui, e.event_x, e.event_y) {
+                activate(app, state, &ui, action)?;
+            }
+        }
+        Event::ButtonRelease(_) => {
+            app.pan_drag = None;
+            finish_drag(app, state);
+        }
+        Event::MotionNotify(e) => {
+            if let Some((start_x, start_y, pan_x, pan_y)) = app.pan_drag {
+                app.pan = (
+                    pan_x + f32::from(e.event_x - start_x),
+                    pan_y + f32::from(e.event_y - start_y),
+                );
+                lp.dirty = true;
+                return Ok(());
+            }
+            if app.drag.is_some() {
+                if !e.state.contains(KeyButMask::BUTTON1) {
+                    finish_drag(app, state);
+                } else {
+                    drag_motion(state, app, (e.event_x, e.event_y));
+                }
+                lp.dirty = true;
+                return Ok(());
+            }
+            let ui = app.ui(state);
+            let hover = hit(state, &ui, e.event_x, e.event_y);
+            if hover != app.hover {
+                app.hover = hover;
+                let cursor = app.cursors.map(|cursors| match hover {
+                    Some(Hit::Monitor(_)) => cursors.fleur,
+                    Some(Hit::NameField) | None => cursors.normal,
+                    Some(_) => cursors.hand,
+                });
+                app.set_cursor(cursor)?;
+                lp.dirty = true;
+            }
+        }
+        Event::ClientMessage(e) if is_close_request(&e, app.wm_protocols, app.wm_delete_window) => {
+            if state.busy {
+                state.quit = true;
+            } else {
+                request_close(state);
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -3952,7 +4490,7 @@ fn request_close(state: &mut State) {
     }
 }
 
-fn confirm_action(app: &mut App, state: &mut State, help: bool) -> Result<(), String> {
+fn confirm_action(_app: &mut App, state: &mut State, _help: bool) -> Result<(), String> {
     let Some(confirm) = state.confirm.take() else {
         return Ok(());
     };
@@ -3961,13 +4499,9 @@ fn confirm_action(app: &mut App, state: &mut State, help: bool) -> Result<(), St
             state.quit = true;
         }
         Confirm::Delete(name) => {
-            let ui = Ui::new(state, app.w, app.h, None, app.zoom, app.pan);
-            state.busy = true;
-            let _ = app.refresh(state, &ui, help);
             if let Err(err) = state.delete_named(&name) {
                 state.set_message(err, true);
             }
-            state.busy = false;
         }
     }
     Ok(())
@@ -4177,28 +4711,7 @@ fn snap_group(
     )
 }
 
-fn activate(
-    app: &mut App,
-    state: &mut State,
-    ui: &Ui,
-    action: Hit,
-    help: bool,
-) -> Result<(), String> {
-    let blocking = matches!(
-        action,
-        Hit::Apply
-            | Hit::Keep
-            | Hit::Revert
-            | Hit::Save
-            | Hit::Rename
-            | Hit::Delete
-            | Hit::Startup
-            | Hit::Reload
-    );
-    if blocking {
-        state.busy = true;
-        let _ = app.refresh(state, ui, help);
-    }
+fn activate(app: &mut App, state: &mut State, ui: &Ui, action: Hit) -> Result<(), String> {
     let result = match action {
         Hit::Monitor(index) | Hit::Output(index) => {
             if index < state.draft.len() {
@@ -4299,44 +4812,15 @@ fn activate(
             }
             Ok(())
         }
-        Hit::Startup => {
-            let name = state
-                .selected_profile
-                .and_then(|index| state.status.profiles.get(index))
-                .map(|profile| profile.name.clone());
-            if let Some(name) = name {
-                let next = if state.status.startup_profile.as_deref() == Some(name.as_str()) {
-                    None
-                } else {
-                    Some(name.as_str())
-                };
-                match backend::set_startup(next) {
-                    Ok(()) => {
-                        let _ = state.reload(false);
-                        state.set_message(
-                            if next.is_some() {
-                                "This profile will be applied at the next login."
-                            } else {
-                                "Startup profile disabled."
-                            },
-                            false,
-                        );
-                    }
-                    Err(err) => state.set_message(err, true),
-                }
-            } else {
-                state.set_message("Select a saved profile first.", true);
-            }
+        Hit::Startup => state.toggle_startup(),
+        Hit::Reload => {
+            state.request_reload(true);
             Ok(())
         }
-        Hit::Reload => state.reload(true),
         Hit::NameField => Ok(()),
     };
     if let Err(err) = result {
         state.set_message(err, true);
-    }
-    if blocking {
-        state.busy = false;
     }
     Ok(())
 }
@@ -4360,26 +4844,9 @@ mod tests {
     }
 
     fn state_with(draft: Vec<DraftOutput>) -> State {
-        State {
-            status: backend::Status::default(),
-            draft,
-            selected: 0,
-            selected_profile: None,
-            focus: None,
-            message: String::new(),
-            message_is_error: false,
-            busy: false,
-            dirty: false,
-            name_mode: None,
-            name_text: String::new(),
-            output_scroll: 0,
-            profile_scroll: 0,
-            confirm: None,
-            quit: false,
-            had_preview: false,
-            preview_layout: None,
-            undo: Vec::new(),
-        }
+        let mut state = State::new(backend::Status::default());
+        state.draft = draft;
+        state
     }
 
     #[test]
@@ -4434,28 +4901,11 @@ mod tests {
 
     #[test]
     fn panel_layout_has_no_control_collisions_at_the_minimum_size() {
-        let mut state = State {
-            status: backend::Status::default(),
-            draft: (0..6)
+        let mut state = state_with(
+            (0..6)
                 .map(|index| output(&format!("o{index}"), index * 1920, 0, "1920x1080"))
                 .collect(),
-            selected: 0,
-            selected_profile: None,
-            focus: None,
-            message: String::new(),
-            message_is_error: false,
-            busy: false,
-            dirty: false,
-            name_mode: None,
-            name_text: String::new(),
-            output_scroll: 0,
-            profile_scroll: 0,
-            confirm: None,
-            quit: false,
-            had_preview: false,
-            preview_layout: None,
-            undo: Vec::new(),
-        };
+        );
         state.draft[0].primary = true;
         let ui = Ui::new(&state, MIN_WIDTH, MIN_HEIGHT, None, 1.0, (0.0, 0.0));
         let mut rects = vec![
@@ -4488,29 +4938,10 @@ mod tests {
 
     #[test]
     fn stable_numbers_survive_a_disabled_screen() {
-        let mut state = State {
-            status: backend::Status::default(),
-            draft: vec![
-                output("a", 0, 0, "1920x1080"),
-                output("b", 1920, 0, "1920x1080"),
-            ],
-            selected: 0,
-            selected_profile: None,
-            focus: None,
-            message: String::new(),
-            message_is_error: false,
-            busy: false,
-            dirty: false,
-            name_mode: None,
-            name_text: String::new(),
-            output_scroll: 0,
-            profile_scroll: 0,
-            confirm: None,
-            quit: false,
-            had_preview: false,
-            preview_layout: None,
-            undo: Vec::new(),
-        };
+        let mut state = state_with(vec![
+            output("a", 0, 0, "1920x1080"),
+            output("b", 1920, 0, "1920x1080"),
+        ]);
         state.draft[0].enabled = false;
         let ui = Ui::new(&state, MIN_WIDTH, MIN_HEIGHT, None, 1.0, (0.0, 0.0));
         let view = ui
@@ -4690,30 +5121,11 @@ mod tests {
 
     #[test]
     fn dragging_a_mirror_group_moves_both_members() {
-        let mut state = State {
-            status: backend::Status::default(),
-            draft: vec![
-                output("a", 0, 0, "1920x1080"),
-                output("b", 0, 0, "1920x1080"),
-                output("c", 1920, 0, "1920x1080"),
-            ],
-            selected: 0,
-            selected_profile: None,
-            focus: None,
-            message: String::new(),
-            message_is_error: false,
-            busy: false,
-            dirty: false,
-            name_mode: None,
-            name_text: String::new(),
-            output_scroll: 0,
-            profile_scroll: 0,
-            confirm: None,
-            quit: false,
-            had_preview: false,
-            preview_layout: None,
-            undo: Vec::new(),
-        };
+        let mut state = state_with(vec![
+            output("a", 0, 0, "1920x1080"),
+            output("b", 0, 0, "1920x1080"),
+            output("c", 1920, 0, "1920x1080"),
+        ]);
         state.draft[0].primary = true;
         state.move_selected(10, 5);
         assert_eq!((state.draft[0].x, state.draft[0].y), (10, 5));

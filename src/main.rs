@@ -7,6 +7,7 @@ mod backend;
 mod keyboard;
 mod text;
 mod theme;
+mod watch;
 mod window;
 
 use std::process::ExitCode;
