@@ -4,7 +4,7 @@
 //! sends that draft through the same preview/keep/revert transaction the CLI
 //! and the launcher use. It owns no profile store and runs no display daemon.
 
-use crate::{backend, text, theme};
+use crate::{backend, keyboard, text, theme};
 use std::time::{Duration, Instant};
 use x11rb::{
     connection::Connection,
@@ -41,17 +41,15 @@ const K_DOWN: u32 = 0xff54;
 const K_PAGEUP: u32 = 0xff55;
 const K_PAGEDOWN: u32 = 0xff56;
 const K_SPACE: u32 = 0x0020;
+const K_KP_ENTER: u32 = 0xff8d;
 const K_F1: u32 = 0xffbe;
 const K_Q: u32 = b'q' as u32;
-const K_Q_SHIFTED: u32 = b'Q' as u32;
 const K_I: u32 = b'i' as u32;
 const K_R: u32 = b'r' as u32;
 const K_Z: u32 = b'z' as u32;
 const K_0: u32 = b'0' as u32;
 const K_N: u32 = b'n' as u32;
-const K_N_SHIFTED: u32 = b'N' as u32;
 const K_Y: u32 = b'y' as u32;
-const K_Y_SHIFTED: u32 = b'Y' as u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
@@ -1776,57 +1774,6 @@ fn focus_order(ui: &Ui) -> Vec<Hit> {
     out
 }
 
-/// Keycode-to-keysym table for the connected keyboard.
-pub struct Keys {
-    table: Vec<u32>,
-    min: u8,
-}
-
-impl Keys {
-    pub fn new(c: &RustConnection) -> Result<Self, String> {
-        let setup = c.setup();
-        let count = setup.max_keycode - setup.min_keycode + 1;
-        let map = c
-            .get_keyboard_mapping(setup.min_keycode, count)
-            .map_err(|e| e.to_string())?
-            .reply()
-            .map_err(|e| e.to_string())?;
-        let per = map.keysyms_per_keycode.max(1) as usize;
-        let table = map
-            .keysyms
-            .chunks(per)
-            .map(|syms| syms.first().copied().unwrap_or(0))
-            .collect();
-        Ok(Self {
-            table,
-            min: setup.min_keycode,
-        })
-    }
-
-    pub fn sym(&self, code: u8) -> u32 {
-        code.checked_sub(self.min)
-            .and_then(|index| self.table.get(index as usize))
-            .copied()
-            .unwrap_or(0)
-    }
-}
-
-fn text_key(sym: u32, shift: bool) -> Option<char> {
-    if (0x20..=0x7e).contains(&sym) {
-        let ch = char::from_u32(sym)?;
-        return Some(if shift { ch.to_ascii_uppercase() } else { ch });
-    }
-    match sym {
-        0x00e5 => Some('å'),
-        0x00c5 => Some('Å'),
-        0x00e4 => Some('ä'),
-        0x00c4 => Some('Ä'),
-        0x00f6 => Some('ö'),
-        0x00d6 => Some('Ö'),
-        _ => None,
-    }
-}
-
 #[derive(Clone, Debug)]
 struct Drag {
     group: Vec<usize>,
@@ -1877,7 +1824,9 @@ pub struct App {
     image_lsb: bool,
     pub palette: theme::Palette,
     font: text::Font,
-    keys: Keys,
+    keys: keyboard::Keys,
+    wm_protocols: Atom,
+    wm_delete_window: Atom,
     drag: Option<Drag>,
     pan_drag: Option<(i16, i16, f32, f32)>,
     zoom: f32,
@@ -1908,7 +1857,7 @@ impl App {
             c.setup().image_byte_order == x11rb::protocol::xproto::ImageOrder::LSB_FIRST;
         let palette = theme::load();
         let font = text::Font::load(palette);
-        let keys = Keys::new(&c)?;
+        let keys = keyboard::Keys::load(&c)?;
         let win = c.generate_id().map_err(|e| e.to_string())?;
         let gc = c.generate_id().map_err(|e| e.to_string())?;
         let back = c.generate_id().map_err(|e| e.to_string())?;
@@ -1996,12 +1945,15 @@ impl App {
             &hints,
         )
         .map_err(|e| e.to_string())?;
+        // Interned once: the close handler compares against these.
+        let wm_protocols = atom("WM_PROTOCOLS")?;
+        let wm_delete_window = atom("WM_DELETE_WINDOW")?;
         c.change_property32(
             PropMode::REPLACE,
             win,
-            atom("WM_PROTOCOLS")?,
+            wm_protocols,
             AtomEnum::ATOM,
-            &[atom("WM_DELETE_WINDOW")?],
+            &[wm_delete_window],
         )
         .map_err(|e| e.to_string())?;
         let cursors = load_cursors(&c);
@@ -2020,6 +1972,8 @@ impl App {
             palette,
             font,
             keys,
+            wm_protocols,
+            wm_delete_window,
             drag: None,
             pan_drag: None,
             zoom: 1.0,
@@ -3592,8 +3546,21 @@ pub fn run(app: &mut App, state: &mut State) -> Result<(), String> {
                         app.resize_backing()?;
                     }
                 }
+                Event::MappingNotify(_) => {
+                    // setxkbmap and every other keymap change: read the
+                    // whole table again so Shift and AltGr stay right.
+                    if let Ok(keys) = keyboard::Keys::load(&app.c) {
+                        app.keys = keys;
+                    }
+                }
                 Event::KeyPress(e) => {
-                    let key = app.keys.sym(e.detail);
+                    // Shortcuts compare against the key's base symbol, text
+                    // against the symbol of the active level.
+                    let key = match app.keys.base(e.detail) {
+                        K_KP_ENTER => K_RETURN,
+                        key => key,
+                    };
+                    let typed = keyboard::text_char(app.keys.sym(e.detail, e.state));
                     let shift = e.state.contains(KeyButMask::SHIFT);
                     let ctrl = e.state.contains(KeyButMask::CONTROL);
                     if state.name_mode.is_some() {
@@ -3630,7 +3597,7 @@ pub fn run(app: &mut App, state: &mut State) -> Result<(), String> {
                                 dirty = true;
                             }
                             _ => {
-                                if let Some(ch) = text_key(key, shift) {
+                                if let Some(ch) = typed {
                                     if state.name_text.chars().count() < 64 {
                                         state.name_text.push(ch);
                                     }
@@ -3641,10 +3608,10 @@ pub fn run(app: &mut App, state: &mut State) -> Result<(), String> {
                     }
                     if state.confirm.is_some() {
                         match key {
-                            K_ESCAPE | K_N | K_N_SHIFTED => {
+                            K_ESCAPE | K_N => {
                                 state.confirm = None;
                             }
-                            K_RETURN | K_Y | K_Y_SHIFTED => {
+                            K_RETURN | K_Y => {
                                 confirm_action(app, state, help)?;
                             }
                             _ => {}
@@ -3665,7 +3632,7 @@ pub fn run(app: &mut App, state: &mut State) -> Result<(), String> {
                         }
                         continue;
                     }
-                    if key == K_Q || key == K_Q_SHIFTED {
+                    if key == K_Q {
                         request_close(state);
                         continue;
                     }
@@ -3903,16 +3870,10 @@ pub fn run(app: &mut App, state: &mut State) -> Result<(), String> {
                         dirty = true;
                     }
                 }
-                Event::ClientMessage(e) => {
-                    let close = app
-                        .c
-                        .intern_atom(false, b"WM_PROTOCOLS")
-                        .ok()
-                        .and_then(|cookie| cookie.reply().ok())
-                        .map(|reply| reply.atom);
-                    if Some(e.type_) == close {
-                        request_close(state);
-                    }
+                Event::ClientMessage(e)
+                    if is_close_request(&e, app.wm_protocols, app.wm_delete_window) =>
+                {
+                    request_close(state);
                 }
                 _ => {}
             }
@@ -3968,6 +3929,11 @@ pub fn run(app: &mut App, state: &mut State) -> Result<(), String> {
         let _ = backend::revert();
     }
     Ok(())
+}
+
+/// A `WM_PROTOCOLS` client message whose first value is `WM_DELETE_WINDOW`.
+fn is_close_request(e: &ClientMessageEvent, protocols: Atom, delete: Atom) -> bool {
+    e.type_ == protocols && e.format == 32 && e.data.as_data32()[0] == delete
 }
 
 fn request_close(state: &mut State) {

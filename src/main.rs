@@ -4,6 +4,7 @@
 //! owns no profile store, no xrandr parser and no rollback timer of its own.
 
 mod backend;
+mod keyboard;
 mod text;
 mod theme;
 mod window;
