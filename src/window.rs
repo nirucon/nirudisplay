@@ -23,8 +23,16 @@ pub const APP_NAME: &str = "NIRU Display";
 
 const WIDTH: u16 = 1120;
 const HEIGHT: u16 = 760;
+/// Below this size the compact layout takes over.
 const MIN_WIDTH: u16 = 900;
 const MIN_HEIGHT: u16 = 700;
+/// D6: the smallest size the compact layout supports, and the minimum the
+/// window advertises. Below it the window asks to be made larger.
+const SMALLEST_WIDTH: u16 = 560;
+const SMALLEST_HEIGHT: u16 = 420;
+const HEADER_COMPACT: i16 = 52;
+/// The panel at its shortest: two screen rows and every control.
+const PANEL_MIN_H: i16 = 28 + 2 * ROW_H + 8 + 128 + 52 + 38;
 
 const PAD: i16 = 20;
 const HEADER: i16 = 76;
@@ -1495,42 +1503,143 @@ pub struct Layout {
     pub panel: Rectangle,
     pub profiles: Rectangle,
     pub footer: Rectangle,
+    /// D6: in the compact layout the canvas, panel and profiles scroll
+    /// inside this rectangle, between the header and the footer.
+    pub viewport: Option<Rectangle>,
+    /// How far the compact content can scroll.
+    pub max_scroll: i16,
+    /// Smaller than the compact layout supports.
+    pub too_small: bool,
+}
+
+fn rect(x: i16, y: i16, width: i32, height: i32) -> Rectangle {
+    Rectangle {
+        x,
+        y,
+        width: width.clamp(0, i32::from(u16::MAX)) as u16,
+        height: height.clamp(0, i32::from(u16::MAX)) as u16,
+    }
 }
 
 pub fn layout(w: u16, h: u16) -> Layout {
-    let canvas_height = i16::try_from(h)
-        .unwrap_or(i16::MAX)
-        .saturating_sub(HEADER + FOOTER + PROFILE_H + 16);
-    let canvas = Rectangle {
-        x: PAD,
-        y: HEADER,
-        width: w.saturating_sub(u16::try_from(PAD * 2 + PANEL_W + 12).unwrap_or(0)),
-        height: u16::try_from(canvas_height).unwrap_or(0),
+    layout_scrolled(w, h, 0)
+}
+
+/// The window's regions at `w`x`h`, with the compact content scrolled by
+/// `scroll` pixels (clamped).
+pub fn layout_scrolled(w: u16, h: u16, scroll: i16) -> Layout {
+    let (wi, hi) = (i32::from(w), i32::from(h));
+    let pad = i32::from(PAD);
+    let footer = rect(
+        PAD,
+        (hi - i32::from(FOOTER)) as i16,
+        wi - pad * 2,
+        i32::from(FOOTER),
+    );
+    if w < SMALLEST_WIDTH || h < SMALLEST_HEIGHT {
+        let empty = rect(0, 0, 0, 0);
+        return Layout {
+            canvas: empty,
+            panel: empty,
+            profiles: empty,
+            footer,
+            viewport: None,
+            max_scroll: 0,
+            too_small: true,
+        };
+    }
+    if w >= MIN_WIDTH && h >= MIN_HEIGHT {
+        let canvas_height = hi - i32::from(HEADER + FOOTER + PROFILE_H + 16);
+        let canvas = rect(
+            PAD,
+            HEADER,
+            wi - i32::from(PAD * 2 + PANEL_W + 12),
+            canvas_height,
+        );
+        let panel = rect(
+            (wi - pad - i32::from(PANEL_W)) as i16,
+            HEADER,
+            i32::from(PANEL_W),
+            canvas_height,
+        );
+        let profiles = rect(
+            PAD,
+            (i32::from(HEADER) + canvas_height + 10) as i16,
+            wi - pad * 2,
+            i32::from(PROFILE_H),
+        );
+        return Layout {
+            canvas,
+            panel,
+            profiles,
+            footer,
+            viewport: None,
+            max_scroll: 0,
+            too_small: false,
+        };
+    }
+    let header = i32::from(HEADER_COMPACT);
+    let viewport = rect(0, HEADER_COMPACT, wi, hi - header - i32::from(FOOTER) - 4);
+    let view_h = i32::from(viewport.height);
+    let (top_h, side) = if w >= MIN_WIDTH {
+        // Wide but short: canvas and panel side by side, as usual.
+        (
+            i32::from(PANEL_MIN_H).max(view_h - i32::from(PROFILE_H) - 10),
+            true,
+        )
+    } else {
+        ((view_h * 55 / 100).clamp(140, 260), false)
     };
-    let panel = Rectangle {
-        x: i16::try_from(w).unwrap_or(i16::MAX) - PAD - PANEL_W,
-        y: HEADER,
-        width: PANEL_W as u16,
-        height: canvas.height,
+    let content = if side {
+        top_h + 10 + i32::from(PROFILE_H) + 6
+    } else {
+        top_h + 10 + i32::from(PANEL_MIN_H) + 10 + i32::from(PROFILE_H) + 6
     };
-    let profiles = Rectangle {
-        x: PAD,
-        y: canvas.y + i16::try_from(canvas.height).unwrap_or(0) + 10,
-        width: w.saturating_sub(PAD as u16 * 2),
-        height: PROFILE_H as u16,
+    let max_scroll = (content - view_h).clamp(0, i32::from(i16::MAX)) as i16;
+    let scroll = i32::from(scroll.clamp(0, max_scroll));
+    let top = header - scroll;
+    let (canvas, panel, below) = if side {
+        (
+            rect(
+                PAD,
+                top as i16,
+                wi - i32::from(PAD * 2 + PANEL_W + 12),
+                top_h,
+            ),
+            rect(
+                (wi - pad - i32::from(PANEL_W)) as i16,
+                top as i16,
+                i32::from(PANEL_W),
+                top_h,
+            ),
+            top + top_h + 10,
+        )
+    } else {
+        let panel_y = top + top_h + 10;
+        (
+            rect(PAD, top as i16, wi - pad * 2, top_h),
+            rect(PAD, panel_y as i16, wi - pad * 2, i32::from(PANEL_MIN_H)),
+            panel_y + i32::from(PANEL_MIN_H) + 10,
+        )
     };
-    let footer = Rectangle {
-        x: PAD,
-        y: i16::try_from(h).unwrap_or(i16::MAX) - FOOTER,
-        width: w.saturating_sub(PAD as u16 * 2),
-        height: FOOTER as u16,
-    };
+    let profiles = rect(PAD, below as i16, wi - pad * 2, i32::from(PROFILE_H));
     Layout {
         canvas,
         panel,
         profiles,
         footer,
+        viewport: Some(viewport),
+        max_scroll,
+        too_small: false,
     }
+}
+
+fn intersect(a: Rectangle, b: Rectangle) -> Rectangle {
+    let x0 = i32::from(a.x).max(i32::from(b.x));
+    let y0 = i32::from(a.y).max(i32::from(b.y));
+    let x1 = (i32::from(a.x) + i32::from(a.width)).min(i32::from(b.x) + i32::from(b.width));
+    let y1 = (i32::from(a.y) + i32::from(a.height)).min(i32::from(b.y) + i32::from(b.height));
+    rect(x0 as i16, y0 as i16, x1 - x0, y1 - y0)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1897,6 +2006,7 @@ struct Ui {
 }
 
 impl Ui {
+    #[cfg(test)]
     fn new(
         state: &State,
         width: u16,
@@ -1905,7 +2015,19 @@ impl Ui {
         zoom: f32,
         pan: (f32, f32),
     ) -> Self {
-        let l = layout(width, height);
+        Self::scrolled(state, width, height, frozen, zoom, pan, 0)
+    }
+
+    fn scrolled(
+        state: &State,
+        width: u16,
+        height: u16,
+        frozen: Option<Canvas>,
+        zoom: f32,
+        pan: (f32, f32),
+        scroll: i16,
+    ) -> Self {
+        let l = layout_scrolled(width, height, scroll);
         let canvas = frozen.unwrap_or_else(|| canvas_for(l.canvas, &state.draft, zoom, pan));
         let monitors = monitor_views(state, canvas);
         let panel = panel_layout(state, l);
@@ -1961,8 +2083,14 @@ fn hit(state: &State, ui: &Ui, x: i16, y: i16) -> Option<Hit> {
     if state.name_mode.is_some() {
         return Some(Hit::NameField);
     }
-    if state.confirm.is_some() {
+    if state.confirm.is_some() || ui.l.too_small {
         return None;
+    }
+    // D6: scrolled-out controls cannot be hit through the header or footer.
+    if let Some(viewport) = ui.l.viewport {
+        if !contains(viewport, x, y) {
+            return None;
+        }
     }
     for view in ui.monitors.iter().rev() {
         if contains(view.rect, x, y) {
@@ -2171,8 +2299,8 @@ fn initial_position(screen_width: u16, screen_height: u16) -> (i16, i16) {
 fn window_size_hints() -> [u32; 18] {
     let mut hints = [0u32; 18];
     hints[0] = 1 << 4; // PMinSize
-    hints[5] = u32::from(MIN_WIDTH);
-    hints[6] = u32::from(MIN_HEIGHT);
+    hints[5] = u32::from(SMALLEST_WIDTH);
+    hints[6] = u32::from(SMALLEST_HEIGHT);
     hints
 }
 
@@ -2202,6 +2330,10 @@ pub struct App {
     cursor: Option<Cursor>,
     overlays: Vec<Window>,
     identify_until: Option<Instant>,
+    /// D6: how far the compact layout is scrolled.
+    scroll: i16,
+    /// Painting is clipped to this (the compact viewport) when set.
+    base_clip: std::cell::Cell<Option<Rectangle>>,
 }
 
 impl App {
@@ -2366,19 +2498,47 @@ impl App {
             cursor: None,
             overlays: Vec::new(),
             identify_until: None,
+            scroll: 0,
+            base_clip: std::cell::Cell::new(None),
         })
     }
 
     /// The layout of everything at the window's current size and view.
     fn ui(&self, state: &State) -> Ui {
-        Ui::new(
+        Ui::scrolled(
             state,
             self.w,
             self.h,
             self.drag.as_ref().map(|drag| drag.canvas),
             self.zoom,
             self.pan,
+            self.scroll,
         )
+    }
+
+    /// Scroll the compact content by `delta` pixels.
+    fn scroll_by(&mut self, delta: i16) {
+        let max = layout(self.w, self.h).max_scroll;
+        self.scroll = self.scroll.saturating_add(delta).clamp(0, max);
+    }
+
+    /// Scroll the compact content so the focused control is in view.
+    fn reveal(&mut self, state: &State) {
+        let ui = self.ui(state);
+        let (Some(viewport), Some(rect)) =
+            (ui.l.viewport, state.focus.and_then(|f| focus_rect(&ui, f)))
+        else {
+            return;
+        };
+        let top = i32::from(viewport.y) + 4;
+        let bottom = i32::from(viewport.y) + i32::from(viewport.height) - 4;
+        let y0 = i32::from(rect.y);
+        let y1 = y0 + i32::from(rect.height);
+        if y0 < top {
+            self.scroll_by((y0 - top) as i16);
+        } else if y1 > bottom {
+            self.scroll_by((y1 - bottom).min(y0 - top) as i16);
+        }
     }
 
     /// The RandR fingerprint (see `watch::Stamps`), read without probing
@@ -2764,6 +2924,10 @@ impl App {
     }
 
     fn clip(&self, rect: Rectangle) -> Result<(), String> {
+        let rect = match self.base_clip.get() {
+            Some(base) => intersect(rect, base),
+            None => rect,
+        };
         self.c
             .set_clip_rectangles(ClipOrdering::UNSORTED, self.gc, 0, 0, &[rect])
             .map_err(|e| e.to_string())?
@@ -2771,23 +2935,30 @@ impl App {
             .map_err(|e| e.to_string())
     }
 
+    /// Back to the base clip: the compact viewport, or the whole window.
     fn unclip(&self) -> Result<(), String> {
+        let full = Rectangle {
+            x: 0,
+            y: 0,
+            width: self.w,
+            height: self.h,
+        };
         self.c
             .set_clip_rectangles(
                 ClipOrdering::UNSORTED,
                 self.gc,
                 0,
                 0,
-                &[Rectangle {
-                    x: 0,
-                    y: 0,
-                    width: self.w,
-                    height: self.h,
-                }],
+                &[self.base_clip.get().unwrap_or(full)],
             )
             .map_err(|e| e.to_string())?
             .check()
             .map_err(|e| e.to_string())
+    }
+
+    fn set_base_clip(&self, rect: Option<Rectangle>) -> Result<(), String> {
+        self.base_clip.set(rect);
+        self.unclip()
     }
 
     fn set_cursor(&mut self, cursor: Option<Cursor>) -> Result<(), String> {
@@ -3014,7 +3185,16 @@ impl App {
                 height: self.h,
             },
         )?;
-        self.label(PAD, PAD - 8, APP_NAME, self.palette.foreground, 20.0)?;
+        if ui.l.too_small {
+            return self.paint_too_small(state, ui);
+        }
+        let compact = ui.l.viewport.is_some();
+        let (title_y, subtitle_y) = if compact {
+            (4, 30)
+        } else {
+            (PAD - 8, PAD + 22)
+        };
+        self.label(PAD, title_y, APP_NAME, self.palette.foreground, 20.0)?;
         let subtitle = format!(
             "{} connected screens    {} saved profiles",
             state
@@ -3025,11 +3205,11 @@ impl App {
                 .count(),
             state.status.profiles.len()
         );
-        self.label(PAD, PAD + 22, &subtitle, self.palette.muted, 12.0)?;
+        self.label(PAD, subtitle_y, &subtitle, self.palette.muted, 12.0)?;
         if state.dirty {
             self.label_right(
                 i16::try_from(self.w).unwrap_or(i16::MAX) - PAD,
-                PAD + 22,
+                subtitle_y,
                 "Unsaved changes",
                 self.palette.warning(),
                 12.0,
@@ -3038,12 +3218,14 @@ impl App {
         if let Some(left) = state.preview_seconds_left(Instant::now()) {
             self.label_right(
                 i16::try_from(self.w).unwrap_or(i16::MAX) - PAD,
-                PAD - 4,
+                title_y + 4,
                 &format!("Preview {left} s"),
                 self.palette.accent,
                 13.0,
             )?;
         }
+        // D6: the compact content is clipped to the scrolling viewport.
+        self.set_base_clip(ui.l.viewport)?;
         self.paint_canvas(state, ui)?;
         self.paint_panel(state, ui)?;
         self.paint_profiles(state, ui)?;
@@ -3059,6 +3241,10 @@ impl App {
                 }
             }
         }
+        self.set_base_clip(None)?;
+        if let Some(viewport) = ui.l.viewport {
+            self.paint_scrollbar(viewport, ui.l.max_scroll)?;
+        }
         if state.name_mode.is_some() {
             self.paint_name(state)?;
         } else if state.confirm.is_some() {
@@ -3068,6 +3254,66 @@ impl App {
         }
         self.paint_footer(state, ui, help)?;
         Ok(())
+    }
+
+    /// D6: below the smallest supported size nothing is clipped into
+    /// uselessness; the window says what to do instead.
+    fn paint_too_small(&self, state: &State, ui: &Ui) -> Result<(), String> {
+        let w = i16::try_from(self.w).unwrap_or(i16::MAX);
+        let h = i16::try_from(self.h).unwrap_or(i16::MAX);
+        let text = "Make the window larger";
+        let width = self.text_width(text, 16.0).ceil() as i16;
+        self.label(
+            ((w - width) / 2).max(4),
+            (h / 2 - 24).max(4),
+            text,
+            self.palette.foreground,
+            16.0,
+        )?;
+        let hint = format!("NIRU Display needs at least {SMALLEST_WIDTH}x{SMALLEST_HEIGHT}.");
+        let width = self.text_width(&hint, 11.0).ceil() as i16;
+        self.label(
+            ((w - width) / 2).max(4),
+            h / 2 + 2,
+            &hint,
+            self.palette.muted,
+            11.0,
+        )?;
+        if state.confirm.is_some() {
+            self.paint_confirm(state)?;
+        } else if state.name_mode.is_some() {
+            self.paint_name(state)?;
+        }
+        let _ = ui;
+        Ok(())
+    }
+
+    /// A thin bar at the right edge of the compact viewport.
+    fn paint_scrollbar(&self, viewport: Rectangle, max_scroll: i16) -> Result<(), String> {
+        if max_scroll <= 0 {
+            return Ok(());
+        }
+        let track = Rectangle {
+            x: viewport.x + i16::try_from(viewport.width).unwrap_or(0) - 6,
+            y: viewport.y + 2,
+            width: 3,
+            height: viewport.height.saturating_sub(4),
+        };
+        self.fill(self.palette.border, track)?;
+        let view = f32::from(viewport.height);
+        let total = view + f32::from(max_scroll);
+        let thumb_h = (f32::from(track.height) * view / total).max(18.0);
+        let travel = f32::from(track.height) - thumb_h;
+        let y = f32::from(track.y)
+            + travel * (f32::from(self.scroll.clamp(0, max_scroll)) / f32::from(max_scroll));
+        self.fill(
+            self.palette.muted,
+            Rectangle {
+                y: y.round() as i16,
+                height: thumb_h.round() as u16,
+                ..track
+            },
+        )
     }
 
     fn paint_canvas(&self, state: &State, ui: &Ui) -> Result<(), String> {
@@ -3859,11 +4105,13 @@ impl App {
     }
 
     fn paint_help(&self) -> Result<(), String> {
+        let compact = self.w < MIN_WIDTH || self.h < MIN_HEIGHT;
+        let (x, y) = if compact { (PAD, PAD) } else { (40, 80) };
         let rect = Rectangle {
-            x: 40,
-            y: 80,
-            width: self.w.saturating_sub(80),
-            height: self.h.saturating_sub(160),
+            x,
+            y,
+            width: self.w.saturating_sub(x as u16 * 2),
+            height: self.h.saturating_sub(y as u16 * 2),
         };
         self.fill(self.palette.background, rect)?;
         self.outline(rect, 2, self.palette.accent)?;
@@ -3889,10 +4137,11 @@ impl App {
             "Screens      click the < > buttons or use the wheel to page",
             "Canvas       wheel zooms; middle-drag pans; 0 resets the view",
         ];
+        let spacing = ((i32::from(rect.height) - 70) / lines.len() as i32).clamp(14, 22) as i16;
         for (index, line) in lines.iter().enumerate() {
             self.label_fit(
                 rect.x + 20,
-                rect.y + 58 + index as i16 * 22,
+                rect.y + 58 + index as i16 * spacing,
                 line,
                 self.palette.muted,
                 self.palette.background,
@@ -4256,10 +4505,13 @@ fn handle_event(
             lp.randr.note(Instant::now());
         }
         Event::ConfigureNotify(e) => {
+            // D6: paint for the real size, even when a tiling layout makes
+            // the window smaller than its minimum.
             if e.width != app.w || e.height != app.h {
-                app.w = e.width.max(MIN_WIDTH);
-                app.h = e.height.max(MIN_HEIGHT);
+                app.w = e.width.max(1);
+                app.h = e.height.max(1);
                 app.resize_backing()?;
+                app.scroll_by(0);
             }
         }
         Event::MappingNotify(_) => {
@@ -4343,6 +4595,10 @@ fn handle_event(
                 lp.help = false;
                 return Ok(());
             }
+            if layout(app.w, app.h).too_small && !matches!(key, K_ESCAPE | K_Q) {
+                // Nothing is drawn to act on; only closing works.
+                return Ok(());
+            }
             if key == K_ESCAPE {
                 if app.drag.is_some() {
                     cancel_drag(app, state);
@@ -4402,6 +4658,7 @@ fn handle_event(
                     None => 0,
                 };
                 state.focus = order.get(next).copied();
+                app.reveal(state);
                 return Ok(());
             }
             if matches!(key, K_PAGEUP | K_PAGEDOWN) {
@@ -4443,7 +4700,12 @@ fn handle_event(
             }
             let ui = app.ui(state);
             if e.detail == 4 || e.detail == 5 {
-                if contains(ui.l.profiles, e.event_x, e.event_y) {
+                let up = e.detail == 4;
+                let over_canvas = contains(ui.l.canvas, e.event_x, e.event_y);
+                if ui.l.max_scroll > 0 && !over_canvas {
+                    // D6: in the compact layout the wheel scrolls the content.
+                    app.scroll_by(if up { -40 } else { 40 });
+                } else if contains(ui.l.profiles, e.event_x, e.event_y) {
                     page_profiles(state, &ui, if e.detail == 4 { -1 } else { 1 });
                 } else if contains(ui.l.panel, e.event_x, e.event_y) {
                     page_outputs(state, &ui, if e.detail == 4 { -1 } else { 1 });
@@ -5200,8 +5462,8 @@ mod tests {
     fn normal_hints_advertise_only_a_sensible_minimum() {
         let hints = super::window_size_hints();
         assert_eq!(hints[0], 1 << 4, "only PMinSize is set");
-        assert_eq!(hints[5], u32::from(super::MIN_WIDTH));
-        assert_eq!(hints[6], u32::from(super::MIN_HEIGHT));
+        assert_eq!(hints[5], u32::from(super::SMALLEST_WIDTH));
+        assert_eq!(hints[6], u32::from(super::SMALLEST_HEIGHT));
         assert_eq!(hints[7], 0, "no 1x1 maximum");
         assert_eq!(hints[8], 0, "no 1x1 maximum");
         assert_eq!(hints[9], 0, "no resize increment");
@@ -5392,5 +5654,113 @@ mod tests {
         answer.seq = 4;
         state.finish(answer);
         assert_eq!(state.status.profiles.len(), 1);
+    }
+
+    /// Every control rectangle of the panel and the profile strip.
+    fn controls(ui: &Ui) -> Vec<Rectangle> {
+        let mut rects = vec![
+            ui.panel.primary,
+            ui.panel.enabled,
+            ui.panel.rotate,
+            ui.panel.identify,
+            ui.panel.mode_prev,
+            ui.panel.mode_next,
+            ui.panel.rate_prev,
+            ui.panel.rate_next,
+            ui.panel.single,
+            ui.panel.extend,
+            ui.panel.mirror,
+            ui.panel.apply[0],
+            ui.panel.apply[1],
+            ui.panel.apply[2],
+        ];
+        rects.extend(ui.panel.rows.iter().map(|(_, rect)| *rect));
+        rects.extend(ui.panel.page_prev);
+        rects.extend(ui.panel.page_next);
+        rects.extend(ui.profiles.rows.iter().map(|(_, rect)| *rect));
+        rects.extend(ui.profiles.actions);
+        rects.extend(ui.profiles.prev);
+        rects.extend(ui.profiles.next);
+        rects
+    }
+
+    #[test]
+    fn the_compact_layout_has_no_collisions_at_560x420_and_scrolls_to_everything() {
+        let mut state = state_with(
+            (0..6)
+                .map(|index| output(&format!("o{index}"), index * 1920, 0, "1920x1080"))
+                .collect(),
+        );
+        state.draft[0].primary = true;
+        state.status.profiles = (0..11)
+            .map(|i| profile(&format!("p{i}"), &["o0"]))
+            .collect();
+        for (w, h) in [(560, 420), (700, 560), (899, 699), (1400, 600), (560, 900)] {
+            let l = layout(w, h);
+            assert!(!l.too_small, "{w}x{h}");
+            let viewport = l.viewport.expect("compact below 900x700");
+            // The regions never overlap and stay inside the window width.
+            for (left, right) in [
+                (l.canvas, l.panel),
+                (l.canvas, l.profiles),
+                (l.panel, l.profiles),
+            ] {
+                assert!(!rects_overlap(left, right), "{w}x{h}: {left:?} {right:?}");
+            }
+            for region in [l.canvas, l.panel, l.profiles] {
+                assert!(
+                    region.x >= 0 && i32::from(region.x) + i32::from(region.width) <= i32::from(w)
+                );
+                assert!(region.width > 0 && region.height > 0, "{w}x{h}: {region:?}");
+            }
+            assert!(
+                l.panel.height as i16 >= PANEL_MIN_H,
+                "the panel is never squeezed"
+            );
+            // Scrolled to the end, the profile strip is fully in view.
+            let end = layout_scrolled(w, h, i16::MAX);
+            let bottom = i32::from(end.profiles.y) + i32::from(end.profiles.height);
+            assert!(
+                bottom <= i32::from(viewport.y) + i32::from(viewport.height),
+                "{w}x{h}"
+            );
+            assert!(
+                i32::from(end.profiles.y) >= i32::from(viewport.y),
+                "{w}x{h}"
+            );
+            for scroll in [0, end.max_scroll / 2, end.max_scroll] {
+                let ui = Ui::scrolled(&state, w, h, None, 1.0, (0.0, 0.0), scroll);
+                let rects = controls(&ui);
+                for (left, rect) in rects.iter().enumerate() {
+                    for other in rects.iter().skip(left + 1) {
+                        assert!(
+                            !rects_overlap(*rect, *other),
+                            "{w}x{h}+{scroll}: controls overlap: {rect:?} {other:?}"
+                        );
+                    }
+                }
+                assert!(!ui.panel.rows.is_empty());
+            }
+        }
+        // The full layout is unchanged at its minimum.
+        let full = layout(MIN_WIDTH, MIN_HEIGHT);
+        assert!(full.viewport.is_none() && full.max_scroll == 0);
+        // Below the smallest size the window asks to be made larger.
+        assert!(layout(559, 420).too_small);
+        assert!(layout(560, 419).too_small);
+        let ui = Ui::new(&state, 400, 300, None, 1.0, (0.0, 0.0));
+        assert_eq!(hit(&state, &ui, 10, 10), None);
+    }
+
+    #[test]
+    fn compact_controls_outside_the_viewport_cannot_be_hit() {
+        let state = state_with(vec![output("a", 0, 0, "1920x1080")]);
+        let ui = Ui::scrolled(&state, 560, 420, None, 1.0, (0.0, 0.0), i16::MAX);
+        let viewport = ui.l.viewport.unwrap();
+        // The canvas is scrolled up under the header: its pixels there are
+        // the header's, not a screen's.
+        let x = ui.l.canvas.x + 10;
+        let y = viewport.y - 5;
+        assert_eq!(hit(&state, &ui, x, y), None);
     }
 }
