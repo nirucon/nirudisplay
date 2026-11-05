@@ -348,23 +348,66 @@ fn events_typing_preview_and_close_under_xvfb() {
     });
     sleep(Duration::from_millis(500));
 
+    // U2: during a preview started here, Enter keeps and Esc reverts.
+    s.key(&["Return"]);
+    s.wait_log(Duration::from_secs(5), "the first preview", |l| {
+        l.iter().filter(|x| x.starts_with("previewed ")).count() == 1
+    });
+    sleep(Duration::from_millis(500));
+    s.key(&["Return"]);
+    s.wait_log(Duration::from_secs(5), "Enter = Keep", |l| {
+        l.iter().any(|x| x.starts_with("done keep "))
+    });
+    sleep(Duration::from_millis(500));
+    s.key(&["Return"]);
+    s.wait_log(Duration::from_secs(5), "the second preview", |l| {
+        l.iter().filter(|x| x.starts_with("previewed ")).count() == 2
+    });
+    sleep(Duration::from_millis(500));
+    s.key(&["Escape"]);
+    s.wait_log(Duration::from_secs(5), "Esc = Revert", |l| {
+        l.iter().any(|x| x.starts_with("done revert "))
+    });
+    assert!(!s.exited(), "Esc closed instead of reverting");
+    sleep(Duration::from_millis(500));
+
+    // D1: a preview that nobody keeps runs out; the window reads the status
+    // just after its local deadline and sees the watchdog's revert, with
+    // no reads every second in between.
+    s.key(&["Return"]);
+    s.wait_log(Duration::from_secs(5), "the third preview", |l| {
+        l.iter().filter(|x| x.starts_with("previewed ")).count() == 3
+    });
+    let reads = s.status_reads();
+    s.wait_log(Duration::from_secs(18), "the expiry", |l| {
+        l.iter().any(|x| x.starts_with("expired "))
+    });
+    let during = s.status_reads() - reads;
+    assert!(
+        during <= 5,
+        "{during} status reads during a 15 s preview (5 s recheck + expiry)"
+    );
+    sleep(Duration::from_millis(800));
+
     // D9: closing during a preview asks; Keep layout keeps and closes.
     s.key(&["Return"]);
     s.wait_log(Duration::from_secs(5), "the preview", |l| {
-        l.iter().any(|x| x.starts_with("previewed "))
+        l.iter().filter(|x| x.starts_with("previewed ")).count() == 4
     });
     sleep(Duration::from_millis(500));
-    s.xdotool(&["key", "Escape"]);
+    // Q closes (Esc would revert a preview started here, see U2).
+    s.xdotool(&["key", "q"]);
     sleep(Duration::from_millis(500));
-    assert!(!s.exited(), "Esc closed the window during a preview");
-    assert!(
-        !s.log().iter().any(|x| x.starts_with("done ")),
+    assert!(!s.exited(), "Q closed the window during a preview");
+    assert_eq!(
+        s.log().iter().filter(|x| x.starts_with("done ")).count(),
+        2,
         "closing kept or reverted without asking: {:?}",
         s.log()
     );
     s.key(&["Return"]);
     s.wait_log(Duration::from_secs(5), "the keep on close", |l| {
-        l.iter().any(|x| x.starts_with("done keep "))
+        l.iter().filter(|x| x.starts_with("done keep ")).count() == 2
     });
     let closed = Instant::now();
     while !s.exited() {

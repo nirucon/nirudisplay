@@ -482,6 +482,15 @@ impl State {
         Some(left.div_ceil(1000) as u64)
     }
 
+    /// The share of the preview time that is left, 0.0 to 1.0.
+    pub fn preview_fraction(&self, now: Instant) -> f32 {
+        let Some(deadline) = self.preview_deadline else {
+            return 0.0;
+        };
+        let left = deadline.saturating_duration_since(now).as_secs_f32();
+        (left / self.preview_total.max(1) as f32).clamp(0.0, 1.0)
+    }
+
     pub fn preview_deadline(&self) -> Option<Instant> {
         self.preview_deadline
     }
@@ -2473,6 +2482,42 @@ fn confirm_buttons(w: u16, h: u16, count: usize) -> Vec<Rectangle> {
         .collect()
 }
 
+/// U4: why a control is disabled, or `None` when it can be used. The
+/// buttons are drawn disabled exactly when this has a reason, and the
+/// reason is shown next to a hovered or focused disabled control.
+fn disabled_reason(state: &State, hit: Hit) -> Option<&'static str> {
+    let selected = state.current();
+    let enabled = selected.is_some_and(|output| output.enabled);
+    let control = !matches!(
+        hit,
+        Hit::Monitor(_) | Hit::Output(_) | Hit::Profile(_) | Hit::NameField | Hit::PopItem(_)
+    );
+    if state.busy && control {
+        return Some("Working\u{2026} Esc closes the window");
+    }
+    match hit {
+        Hit::Primary if !enabled => Some("Enable the screen to make it primary"),
+        Hit::Enabled | Hit::Single if selected.is_none() => Some("Select a screen first"),
+        Hit::Rotate if !enabled => Some("Enable the screen to rotate it"),
+        Hit::Mode if !enabled => Some("Enable the screen to choose its mode"),
+        Hit::Rate if !enabled => Some("Enable the screen to choose its refresh rate"),
+        Hit::Extend if state.draft.len() < 2 => Some("Extend needs two connected screens"),
+        Hit::Mirror if !enabled => Some("Enable the screen to mirror it"),
+        Hit::Mirror if state.draft.iter().filter(|o| o.enabled).count() < 2 => {
+            Some("Mirror needs two enabled screens")
+        }
+        Hit::Keep if !state.preview_active() => Some("Keep is available during a preview"),
+        Hit::Keep if state.preview_changed() => {
+            Some("The draft changed after the preview; press Preview again")
+        }
+        Hit::Revert if !state.preview_active() => Some("Revert is available during a preview"),
+        Hit::Rename | Hit::Delete | Hit::Startup if state.selected_profile.is_none() => {
+            Some("Select a profile first")
+        }
+        _ => None,
+    }
+}
+
 /// Where an open list is drawn: under its button, or above it when the
 /// window is too short, with the rows that fit.
 #[derive(Clone, Debug)]
@@ -2789,6 +2834,8 @@ pub struct App {
     identify_until: Option<Instant>,
     /// D6: how far the compact layout is scrolled.
     scroll: i16,
+    /// U4: the hovered control's rectangle while painting.
+    hover_rect: std::cell::Cell<Option<Rectangle>>,
     /// The last click, for the profile double-click.
     last_click: Option<(Hit, Instant)>,
     /// Painting is clipped to this (the compact viewport) when set.
@@ -2958,6 +3005,7 @@ impl App {
             overlays: Vec::new(),
             identify_until: None,
             scroll: 0,
+            hover_rect: std::cell::Cell::new(None),
             last_click: None,
             base_clip: std::cell::Cell::new(None),
         })
@@ -3327,10 +3375,27 @@ impl App {
         enabled: bool,
         bg: u32,
     ) -> Result<(), String> {
+        let hovered = self.hover_rect.get().is_some_and(|hover| {
+            hover.x == rect.x
+                && hover.y == rect.y
+                && hover.width == rect.width
+                && hover.height == rect.height
+        });
         let (fill, fg) = if !enabled {
             (self.palette.background, self.palette.border)
+        } else if active && hovered {
+            (
+                theme::Palette::blend(self.palette.accent, self.palette.foreground, 0.15),
+                self.palette.background,
+            )
         } else if active {
             (self.palette.accent, self.palette.background)
+        } else if hovered {
+            // U4: a hovered button lifts towards the foreground.
+            (
+                theme::Palette::blend(bg, self.palette.foreground, 0.10),
+                self.palette.foreground,
+            )
         } else {
             (bg, self.palette.foreground)
         };
@@ -3684,6 +3749,11 @@ impl App {
                 13.0,
             )?;
         }
+        self.hover_rect.set(
+            self.hover
+                .filter(|_| self.drag.is_none())
+                .and_then(|hover| focus_rect(ui, hover)),
+        );
         // D6: the compact content is clipped to the scrolling viewport.
         self.set_base_clip(ui.l.viewport)?;
         self.paint_canvas(state, ui)?;
@@ -3706,6 +3776,10 @@ impl App {
             self.paint_scrollbar(viewport, ui.l.max_scroll)?;
         }
         self.paint_popover(state, ui)?;
+        if state.popover.is_none() && state.name_mode.is_none() && state.confirm.is_none() && !help
+        {
+            self.paint_tip(state, ui)?;
+        }
         if state.name_mode.is_some() {
             self.paint_name(state)?;
         } else if state.confirm.is_some() {
@@ -3747,6 +3821,47 @@ impl App {
         }
         let _ = ui;
         Ok(())
+    }
+
+    /// U4: a short line next to a hovered (or else focused) disabled
+    /// control that says why it is disabled.
+    fn paint_tip(&self, state: &State, ui: &Ui) -> Result<(), String> {
+        let target = self
+            .hover
+            .filter(|_| self.drag.is_none())
+            .and_then(|hit| disabled_reason(state, hit).map(|why| (hit, why)))
+            .or_else(|| {
+                state
+                    .focus
+                    .and_then(|hit| disabled_reason(state, hit).map(|why| (hit, why)))
+            });
+        let Some((hit, why)) = target else {
+            return Ok(());
+        };
+        let Some(anchor) = focus_rect(ui, hit) else {
+            return Ok(());
+        };
+        let width = (self.text_width(why, 11.0).ceil() as i32 + 12).min(i32::from(self.w) - 8);
+        let height = 20;
+        let x = i32::from(anchor.x).clamp(4, (i32::from(self.w) - width - 4).max(4));
+        let above = i32::from(anchor.y) - height - 3;
+        let y = if above >= 4 {
+            above
+        } else {
+            i32::from(anchor.y) + i32::from(anchor.height) + 3
+        };
+        let tip = rect(x as i16, y as i16, width, height);
+        self.fill(self.palette.surface, tip)?;
+        self.outline(tip, 1, self.palette.frame())?;
+        self.label_fit(
+            tip.x + 6,
+            tip.y + 3,
+            why,
+            self.palette.foreground,
+            self.palette.surface,
+            11.0,
+            f32::from(tip.width) - 10.0,
+        )
     }
 
     /// U1: the open mode, rate or rotation list.
@@ -3999,12 +4114,20 @@ impl App {
         let Some(first) = state.draft.get(view.members[0]) else {
             return Ok(());
         };
+        let hovered = self.drag.is_none()
+            && matches!(self.hover, Some(Hit::Monitor(index)) if view.members.contains(&index));
         let bg = if !view.enabled {
             self.palette.background
         } else if view.selected {
             self.palette.screen_selected()
         } else {
             self.palette.screen()
+        };
+        // U4: a hovered screen lifts a little towards the foreground.
+        let bg = if hovered {
+            theme::Palette::blend(bg, self.palette.foreground, 0.06)
+        } else {
+            bg
         };
         let frame = if view.overlapping {
             self.palette.error()
@@ -4266,7 +4389,7 @@ impl App {
         let selected = state.current();
         let enabled = selected.map(|output| output.enabled).unwrap_or(false);
         let primary = selected.map(|output| output.primary).unwrap_or(false);
-        let mirror_count = state.draft.iter().filter(|output| output.enabled).count();
+        let usable = |hit: Hit| disabled_reason(state, hit).is_none();
         self.button(
             panel.primary,
             if primary {
@@ -4275,14 +4398,14 @@ impl App {
                 "Set primary"
             },
             primary,
-            enabled,
+            usable(Hit::Primary),
             self.palette.surface,
         )?;
         self.button(
             panel.enabled,
             if enabled { "Enabled: yes" } else { "Disabled" },
             enabled,
-            selected.is_some(),
+            usable(Hit::Enabled),
             self.palette.surface,
         )?;
         self.button(
@@ -4299,14 +4422,14 @@ impl App {
                 }
             ),
             state.popover.as_ref().map(|p| p.kind) == Some(PopKind::Rotation),
-            enabled,
+            usable(Hit::Rotate),
             self.palette.surface,
         )?;
         self.button(
             panel.identify,
             "Identify",
             false,
-            true,
+            usable(Hit::Identify),
             self.palette.surface,
         )?;
         let arrow = if self.font.has('\u{25be}') {
@@ -4324,7 +4447,7 @@ impl App {
                     .unwrap_or("Mode")
             ),
             state.popover.as_ref().map(|p| p.kind) == Some(PopKind::Mode),
-            enabled,
+            usable(Hit::Mode),
             self.palette.surface,
         )?;
         self.button(
@@ -4338,31 +4461,60 @@ impl App {
                     .unwrap_or_else(|| "Rate".into())
             ),
             state.popover.as_ref().map(|p| p.kind) == Some(PopKind::Rate),
-            enabled,
+            usable(Hit::Rate),
             self.palette.surface,
         )?;
         self.button(
             panel.single,
             "Single",
             false,
-            selected.is_some(),
+            usable(Hit::Single),
             self.palette.surface,
         )?;
         self.button(
             panel.extend,
             "Extend",
             false,
-            state.draft.len() > 1,
+            usable(Hit::Extend),
             self.palette.surface,
         )?;
         self.button(
             panel.mirror,
             "Mirror",
             false,
-            mirror_count > 1 && enabled,
+            usable(Hit::Mirror),
             self.palette.surface,
         )?;
-        if let Some(output) = selected {
+        if let (Some(left), true) = (
+            state.preview_seconds_left(Instant::now()),
+            state.preview_active(),
+        ) {
+            // U2: a large countdown and a bar that empties.
+            self.label_fit(
+                panel.info.x,
+                panel.info.y - 2,
+                &format!("Keep within {left} s"),
+                self.palette.accent,
+                self.palette.surface,
+                18.0,
+                f32::from(panel.info.width),
+            )?;
+            let bar = Rectangle {
+                x: panel.info.x,
+                y: panel.info.y + 30,
+                width: panel.info.width,
+                height: 6,
+            };
+            self.fill(self.palette.border, bar)?;
+            let fraction = state.preview_fraction(Instant::now());
+            self.fill(
+                self.palette.accent,
+                Rectangle {
+                    width: (f32::from(bar.width) * fraction).round() as u16,
+                    ..bar
+                },
+            )?;
+        } else if let Some(output) = selected {
             let rate = output
                 .rate
                 .map(|rate| format!("{rate:.2} Hz"))
@@ -4412,12 +4564,11 @@ impl App {
                 )?;
             }
         }
-        let changed = state.preview_changed();
         self.button(
             panel.apply[0],
             "Preview",
             false,
-            !state.busy,
+            usable(Hit::Apply),
             self.palette.surface,
         )?;
         self.button(
@@ -4430,14 +4581,14 @@ impl App {
                     .unwrap_or_default()
             ),
             state.preview_active(),
-            state.preview_active() && !changed && !state.busy,
+            usable(Hit::Keep),
             self.palette.surface,
         )?;
         self.button(
             panel.apply[2],
             "Revert",
             false,
-            state.preview_active() && !state.busy,
+            usable(Hit::Revert),
             self.palette.surface,
         )?;
         Ok(())
@@ -4504,15 +4655,22 @@ impl App {
             (3, startup_text, startup_selected),
             (4, "Reload", false),
         ] {
-            let enabled = match index {
-                1..=3 => state.selected_profile.is_some(),
-                _ => true,
-            };
+            let enabled = disabled_reason(
+                state,
+                [
+                    Hit::Save,
+                    Hit::Rename,
+                    Hit::Delete,
+                    Hit::Startup,
+                    Hit::Reload,
+                ][index],
+            )
+            .is_none();
             self.button(
                 layout.actions[index],
                 text,
                 active && enabled,
-                enabled && !state.busy,
+                enabled,
                 self.palette.surface,
             )?;
         }
@@ -4816,7 +4974,11 @@ impl App {
             self.label_fit(
                 ui.l.footer.x,
                 ui.l.footer.y + 32,
-                "Tab focus · drag screens · arrows move · I identify · Ctrl+Z undo · Enter preview · F1 help · Esc close",
+                if state.own_preview && state.preview_active() {
+                    "Enter keeps the layout · Esc reverts · Tab focus · F1 help"
+                } else {
+                    "Tab focus · drag screens · arrows move · I identify · Ctrl+Z undo · Enter preview · F1 help · Esc close"
+                },
                 self.palette.muted,
                 self.palette.background,
                 10.0,
@@ -5238,6 +5400,11 @@ fn handle_event(
                     cancel_drag(app, state);
                 } else if state.focus.is_some() {
                     state.focus = None;
+                } else if state.own_preview && state.preview_active() {
+                    // U2: Esc reverts a preview this window started.
+                    if let Err(err) = state.revert() {
+                        state.set_message(err, true);
+                    }
                 } else {
                     request_close(state);
                 }
@@ -5311,7 +5478,13 @@ fn handle_event(
                     let ui = app.ui(state);
                     activate(app, state, &ui, focus)?;
                 } else if key == K_RETURN {
-                    if let Err(err) = state.apply_preview() {
+                    // U2: Enter keeps a preview this window started.
+                    let result = if state.own_preview && state.preview_active() {
+                        state.keep()
+                    } else {
+                        state.apply_preview()
+                    };
+                    if let Err(err) = result {
                         state.set_message(err, true);
                     }
                 }
@@ -6630,5 +6803,111 @@ mod tests {
         }
         state.popover_key(K_HOME);
         assert_eq!(state.popover.as_ref().unwrap().scroll, 0);
+    }
+
+    #[test]
+    fn disabled_controls_explain_themselves() {
+        let mut state = state_with(vec![output("a", 0, 0, "1920x1080")]);
+        assert_eq!(
+            disabled_reason(&state, Hit::Keep),
+            Some("Keep is available during a preview")
+        );
+        assert_eq!(
+            disabled_reason(&state, Hit::Revert),
+            Some("Revert is available during a preview")
+        );
+        assert_eq!(
+            disabled_reason(&state, Hit::Extend),
+            Some("Extend needs two connected screens")
+        );
+        assert_eq!(
+            disabled_reason(&state, Hit::Mirror),
+            Some("Mirror needs two enabled screens")
+        );
+        assert_eq!(
+            disabled_reason(&state, Hit::Delete),
+            Some("Select a profile first")
+        );
+        assert_eq!(disabled_reason(&state, Hit::Apply), None);
+        assert_eq!(disabled_reason(&state, Hit::Mode), None);
+        state.draft[0].enabled = false;
+        assert!(disabled_reason(&state, Hit::Mode).is_some());
+        assert!(disabled_reason(&state, Hit::Primary).is_some());
+        state.draft[0].enabled = true;
+        state.status.preview = Some(backend::Preview {
+            name: "Draft".into(),
+            token: "t".into(),
+            seconds_left: 9,
+        });
+        assert_eq!(disabled_reason(&state, Hit::Keep), None);
+        state.busy = true;
+        assert!(disabled_reason(&state, Hit::Keep)
+            .unwrap()
+            .starts_with("Working"));
+        assert_eq!(
+            disabled_reason(&state, Hit::Monitor(0)),
+            None,
+            "screens stay"
+        );
+    }
+
+    #[test]
+    fn the_preview_countdown_runs_from_a_local_deadline() {
+        let mut state = state_with(vec![output("a", 0, 0, "1920x1080")]);
+        let status = backend::Status {
+            preview: Some(backend::Preview {
+                name: "Draft".into(),
+                token: "t1".into(),
+                seconds_left: 15,
+            }),
+            ..Default::default()
+        };
+        state.finish(backend::Done {
+            seq: 1,
+            after: After::Preview {
+                layout: state.draft.clone(),
+            },
+            result: Ok(()),
+            status: Ok(status),
+        });
+        assert!(state.own_preview, "started here: Enter keeps, Esc reverts");
+        let now = Instant::now();
+        assert_eq!(state.preview_seconds_left(now), Some(15));
+        assert_eq!(
+            state.preview_seconds_left(now + Duration::from_millis(4500)),
+            Some(11)
+        );
+        assert_eq!(
+            state.preview_seconds_left(now + Duration::from_secs(20)),
+            Some(0)
+        );
+        assert!(state.preview_fraction(now) > 0.95);
+        assert!(state.preview_fraction(now + Duration::from_millis(7500)) < 0.55);
+        // A preview adopted from elsewhere is not this window's.
+        let other = backend::Status {
+            preview: Some(backend::Preview {
+                name: "CLI".into(),
+                token: "t2".into(),
+                seconds_left: 8,
+            }),
+            ..Default::default()
+        };
+        state.apply_status(other, false);
+        assert!(!state.own_preview);
+        assert_eq!(state.preview_seconds_left(Instant::now()), Some(8));
+        state.apply_status(backend::Status::default(), false);
+        assert_eq!(state.preview_seconds_left(Instant::now()), None);
+        assert!(state.message.starts_with("Preview ended"));
+    }
+
+    #[test]
+    fn the_next_countdown_tick_is_on_the_second() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(4300);
+        assert_eq!(next_second(deadline, now), now + Duration::from_millis(300));
+        assert_eq!(
+            next_second(now + Duration::from_secs(3), now),
+            now + Duration::from_secs(1)
+        );
     }
 }
