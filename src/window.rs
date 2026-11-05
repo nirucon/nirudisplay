@@ -5282,6 +5282,9 @@ fn handle_event(
     if !matches!(
         event,
         Event::NoExposure(_)
+            // A restack (a lock screen or a panel raising itself) sends
+            // ConfigureNotify without a new size: nothing to repaint.
+            | Event::ConfigureNotify(_)
             | Event::MotionNotify(_)
             | Event::MappingNotify(_)
             | Event::RandrScreenChangeNotify(_)
@@ -5304,6 +5307,7 @@ fn handle_event(
                 app.h = e.height.max(1);
                 app.resize_backing()?;
                 app.scroll_by(0);
+                lp.dirty = true;
             }
         }
         Event::MappingNotify(_) => {
