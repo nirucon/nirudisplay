@@ -13,3 +13,23 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --release --locked
       - run: sh tests/cli-smoke.sh target/release/nirudisplay
+  msrv:
+    # rust-version in Cargo.toml, which is also Debian 13's rustc: a
+    # lockfile bump must never need a newer compiler.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo build --locked
+      - run: cargo build --release --locked
+      - run: cargo test --locked
+  xvfb:
+    # The window under Xvfb against a recording fixture niructl: idle
+    # spawns, RandR reaction, Swedish typing, replace/update, preview
+    # countdown, Enter/Esc, close-during-preview and a slow preview.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y xvfb xdotool x11-apps x11-xkb-utils x11-xserver-utils fonts-dejavu-core
+      - run: cargo test --locked --test xvfb -- --ignored
