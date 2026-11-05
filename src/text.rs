@@ -27,6 +27,12 @@ impl Font {
         }
     }
 
+    /// True when the face has a glyph for `c`, so a symbol such as a check
+    /// mark can fall back to plain text on a font without it.
+    pub fn has(&self, c: char) -> bool {
+        self.face.glyph_id(c).0 != 0
+    }
+
     /// Width of a string in pixels.
     pub fn width(&self, text: &str) -> f32 {
         let scaled = self.face.as_scaled(PxScale::from(self.size));

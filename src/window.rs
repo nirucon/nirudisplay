@@ -55,6 +55,8 @@ const K_RIGHT: u32 = 0xff53;
 const K_DOWN: u32 = 0xff54;
 const K_PAGEUP: u32 = 0xff55;
 const K_PAGEDOWN: u32 = 0xff56;
+const K_HOME: u32 = 0xff50;
+const K_END: u32 = 0xff57;
 const K_SPACE: u32 = 0x0020;
 const K_KP_ENTER: u32 = 0xff8d;
 const K_F1: u32 = 0xffbe;
@@ -75,10 +77,11 @@ pub enum Hit {
     Enabled,
     Primary,
     Rotate,
-    ModePrev,
-    ModeNext,
-    RatePrev,
-    RateNext,
+    /// U1: the mode and rate buttons open a list.
+    Mode,
+    Rate,
+    /// A row of the open mode/rate/rotation list.
+    PopItem(usize),
     Identify,
     Single,
     Extend,
@@ -212,6 +215,53 @@ impl Confirm {
     }
 }
 
+pub const ROTATIONS: [&str; 4] = ["normal", "left", "inverted", "right"];
+/// Rows a mode/rate list shows at most.
+const POP_ROWS: usize = 10;
+const POP_ROW_H: i16 = 24;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopKind {
+    Mode,
+    Rate,
+    Rotation,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PopValue {
+    Mode(backend::DisplayMode),
+    Rate(f64),
+    Rotation(&'static str),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PopItem {
+    pub label: String,
+    pub note: Option<&'static str>,
+    pub checked: bool,
+    pub value: PopValue,
+}
+
+/// U1: an open mode, rate or rotation list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Popover {
+    pub kind: PopKind,
+    pub items: Vec<PopItem>,
+    pub cursor: usize,
+    pub scroll: usize,
+}
+
+impl Popover {
+    /// Keep the cursor among the visible rows.
+    fn reveal(&mut self) {
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + POP_ROWS {
+            self.scroll = self.cursor + 1 - POP_ROWS;
+        }
+    }
+}
+
 /// What the window does with a finished backend job. It travels to the
 /// worker with the job and back with the answer.
 #[derive(Clone, Debug, PartialEq)]
@@ -293,6 +343,7 @@ pub struct State {
     pub output_scroll: usize,
     pub profile_scroll: usize,
     pub confirm: Option<Confirm>,
+    pub popover: Option<Popover>,
     pub quit: bool,
     /// Jobs for the worker, taken by the event loop.
     pub outbox: Vec<(backend::Job, After)>,
@@ -330,6 +381,7 @@ impl State {
             output_scroll: 0,
             profile_scroll: 0,
             confirm: None,
+            popover: None,
             quit: false,
             outbox: Vec::new(),
             in_flight: 0,
@@ -787,7 +839,21 @@ impl State {
         self.dirty = true;
     }
 
-    pub fn rotate(&mut self) {
+    /// Step through normal, left, inverted, right.
+    pub fn cycle_rotation(&mut self, delta: i32) {
+        let Some(current) = self.current().map(|output| output.rotation.clone()) else {
+            return;
+        };
+        let index = ROTATIONS
+            .iter()
+            .position(|rotation| *rotation == current)
+            .unwrap_or(0) as i32;
+        let next = (index + delta).rem_euclid(ROTATIONS.len() as i32) as usize;
+        self.set_rotation(ROTATIONS[next]);
+    }
+
+    /// Rotate the selected screen (and its mirror group) about its centre.
+    pub fn set_rotation(&mut self, rotation: &str) {
         let group = self.mirror_group(self.selected);
         let Some(source) = self.current().cloned() else {
             return;
@@ -796,13 +862,10 @@ impl State {
             self.set_message("Enable the screen before rotating it.", true);
             return;
         }
-        let rotation = match source.rotation.as_str() {
-            "normal" => "left",
-            "left" => "inverted",
-            "inverted" => "right",
-            _ => "normal",
+        if source.rotation == rotation {
+            return;
         }
-        .to_string();
+        let rotation = rotation.to_string();
         let (old_width, old_height) = source.size();
         let center_x = source.x + old_width / 2;
         let center_y = source.y + old_height / 2;
@@ -821,6 +884,213 @@ impl State {
         }
         normalize_draft(&mut self.draft);
         self.dirty = true;
+    }
+
+    /// The modes the selected screen (or every screen of its mirror group)
+    /// supports.
+    fn modes_for_selected(&self) -> Vec<backend::DisplayMode> {
+        let Some(output) = self.current() else {
+            return Vec::new();
+        };
+        let group = self.mirror_group(self.selected);
+        if group.len() > 1 {
+            self.common_modes_for_group(&group)
+        } else {
+            self.status
+                .output(&output.name)
+                .map(|screen| screen.modes.clone())
+                .unwrap_or_default()
+        }
+    }
+
+    /// Set the selected screen's (and mirror group's) mode, keeping the
+    /// rate when the new mode has it.
+    pub fn set_mode(&mut self, mode: &backend::DisplayMode) {
+        let Some(output) = self.current().cloned() else {
+            return;
+        };
+        let rate = output
+            .rate
+            .filter(|rate| {
+                mode.rates
+                    .iter()
+                    .any(|candidate| (candidate - rate).abs() < 0.01)
+            })
+            .or_else(|| mode.rates.first().copied());
+        if output.mode == mode.mode && output.rate == rate {
+            return;
+        }
+        self.checkpoint();
+        for index in self.mirror_group(self.selected) {
+            if let Some(output) = self.draft.get_mut(index) {
+                output.mode = mode.mode.clone();
+                output.rate = rate;
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub fn set_rate(&mut self, rate: f64) {
+        if self.current().and_then(|output| output.rate) == Some(rate) {
+            return;
+        }
+        self.checkpoint();
+        for index in self.mirror_group(self.selected) {
+            if let Some(output) = self.draft.get_mut(index) {
+                output.rate = Some(rate);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// U1: the entries of a mode, rate or rotation list for the selected
+    /// screen. Modes are sorted by size with the preferred one marked;
+    /// rates are those of the chosen mode; mirror groups only list what
+    /// every member supports.
+    pub fn popover_items(&self, kind: PopKind) -> Result<Vec<PopItem>, String> {
+        let output = self.current().ok_or("Select a screen first.")?;
+        if !output.enabled {
+            return Err(match kind {
+                PopKind::Mode => "Enable the screen before choosing a mode.",
+                PopKind::Rate => "Enable the screen before choosing a refresh rate.",
+                PopKind::Rotation => "Enable the screen before rotating it.",
+            }
+            .into());
+        }
+        let items: Vec<PopItem> = match kind {
+            PopKind::Mode => {
+                let mut modes = self.modes_for_selected();
+                let mut seen = Vec::new();
+                modes.retain(|mode| {
+                    let new = !seen.contains(&mode.mode);
+                    seen.push(mode.mode.clone());
+                    new
+                });
+                modes.sort_by_key(|mode| {
+                    let (w, h) = mode_size(&mode.mode).unwrap_or((0, 0));
+                    (
+                        std::cmp::Reverse(i64::from(w) * i64::from(h)),
+                        std::cmp::Reverse(w),
+                    )
+                });
+                modes
+                    .into_iter()
+                    .map(|mode| PopItem {
+                        label: mode.mode.clone(),
+                        note: mode.preferred.then_some("preferred"),
+                        checked: mode.mode == output.mode,
+                        value: PopValue::Mode(mode),
+                    })
+                    .collect()
+            }
+            PopKind::Rate => {
+                let group = self.mirror_group(self.selected);
+                let mut rates = if group.len() > 1 {
+                    self.common_rates_for_group(&group, &output.mode)
+                } else {
+                    self.status
+                        .output(&output.name)
+                        .and_then(|state| state.modes.iter().find(|mode| mode.mode == output.mode))
+                        .map(|mode| mode.rates.clone())
+                        .unwrap_or_default()
+                };
+                rates.sort_by(|a, b| b.total_cmp(a));
+                rates.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+                rates
+                    .into_iter()
+                    .map(|rate| PopItem {
+                        label: format!("{rate:.2} Hz"),
+                        note: None,
+                        checked: output
+                            .rate
+                            .is_some_and(|current| (current - rate).abs() < 0.01),
+                        value: PopValue::Rate(rate),
+                    })
+                    .collect()
+            }
+            PopKind::Rotation => ROTATIONS
+                .iter()
+                .map(|rotation| PopItem {
+                    label: (*rotation).to_string(),
+                    note: None,
+                    checked: output.rotation == *rotation,
+                    value: PopValue::Rotation(rotation),
+                })
+                .collect(),
+        };
+        if items.is_empty() {
+            return Err(match kind {
+                PopKind::Rate => {
+                    "No refresh rates are available on every screen in this mirror group."
+                }
+                _ => "No modes are available on every screen in this mirror group.",
+            }
+            .into());
+        }
+        Ok(items)
+    }
+
+    pub fn open_popover(&mut self, kind: PopKind) -> Result<(), String> {
+        let items = self.popover_items(kind)?;
+        let cursor = items.iter().position(|item| item.checked).unwrap_or(0);
+        let mut popover = Popover {
+            kind,
+            items,
+            cursor,
+            scroll: 0,
+        };
+        popover.reveal();
+        self.focus = Some(match kind {
+            PopKind::Mode => Hit::Mode,
+            PopKind::Rate => Hit::Rate,
+            PopKind::Rotation => Hit::Rotate,
+        });
+        self.popover = Some(popover);
+        Ok(())
+    }
+
+    /// Keys while a list is open: arrows move, Enter/Space choose, Esc and
+    /// Tab close. Returns false for keys the list does not use.
+    pub fn popover_key(&mut self, key: u32) -> bool {
+        let Some(popover) = self.popover.as_mut() else {
+            return false;
+        };
+        let last = popover.items.len().saturating_sub(1);
+        match key {
+            K_UP => popover.cursor = popover.cursor.saturating_sub(1),
+            K_DOWN => popover.cursor = (popover.cursor + 1).min(last),
+            K_PAGEUP => popover.cursor = popover.cursor.saturating_sub(POP_ROWS),
+            K_PAGEDOWN => popover.cursor = (popover.cursor + POP_ROWS).min(last),
+            K_HOME => popover.cursor = 0,
+            K_END => popover.cursor = last,
+            K_RETURN | K_SPACE => {
+                let index = popover.cursor;
+                self.choose_popover(index);
+                return true;
+            }
+            K_ESCAPE | K_TAB => {
+                self.popover = None;
+                return true;
+            }
+            _ => return false,
+        }
+        popover.reveal();
+        true
+    }
+
+    /// Apply entry `index` of the open list and close it.
+    pub fn choose_popover(&mut self, index: usize) {
+        let Some(popover) = self.popover.take() else {
+            return;
+        };
+        let Some(item) = popover.items.into_iter().nth(index) else {
+            return;
+        };
+        match item.value {
+            PopValue::Mode(mode) => self.set_mode(&mode),
+            PopValue::Rate(rate) => self.set_rate(rate),
+            PopValue::Rotation(rotation) => self.set_rotation(rotation),
+        }
     }
 
     fn common_modes_for_group(&self, group: &[usize]) -> Vec<backend::DisplayMode> {
@@ -1918,10 +2188,8 @@ struct PanelLayout {
     enabled: Rectangle,
     rotate: Rectangle,
     identify: Rectangle,
-    mode_prev: Rectangle,
-    mode_next: Rectangle,
-    rate_prev: Rectangle,
-    rate_next: Rectangle,
+    mode: Rectangle,
+    rate: Rectangle,
     single: Rectangle,
     extend: Rectangle,
     mirror: Rectangle,
@@ -1980,7 +2248,6 @@ fn panel_layout(state: &State, l: Layout) -> PanelLayout {
     let gap = 6u16;
     let gap_i = 6i16;
     let half = (width.saturating_sub(gap)) / 2;
-    let quarter = (width.saturating_sub(gap * 3)) / 4;
     let third = (width.saturating_sub(gap * 2)) / 3;
     let pair = |row: i16, right: bool, w: u16| Rectangle {
         x: x + if right {
@@ -1990,12 +2257,6 @@ fn panel_layout(state: &State, l: Layout) -> PanelLayout {
         },
         y: props_y + row * 30,
         width: w,
-        height: 28,
-    };
-    let fourth = |slot: i16| Rectangle {
-        x: x + slot * (i16::try_from(quarter).unwrap_or(0) + gap_i),
-        y: props_y + 60,
-        width: quarter,
         height: 28,
     };
     let third_rect = |slot: i16| Rectangle {
@@ -2033,10 +2294,8 @@ fn panel_layout(state: &State, l: Layout) -> PanelLayout {
         enabled: pair(0, true, half),
         rotate: pair(1, false, half),
         identify: pair(1, true, half),
-        mode_prev: fourth(0),
-        mode_next: fourth(1),
-        rate_prev: fourth(2),
-        rate_next: fourth(3),
+        mode: pair(2, false, half),
+        rate: pair(2, true, half),
         single: third_rect(0),
         extend: third_rect(1),
         mirror: third_rect(2),
@@ -2214,12 +2473,80 @@ fn confirm_buttons(w: u16, h: u16, count: usize) -> Vec<Rectangle> {
         .collect()
 }
 
+/// Where an open list is drawn: under its button, or above it when the
+/// window is too short, with the rows that fit.
+#[derive(Clone, Debug)]
+struct PopLayout {
+    rect: Rectangle,
+    rows: Vec<(usize, Rectangle)>,
+}
+
+fn popover_layout(state: &State, ui: &Ui, w: u16, h: u16) -> Option<PopLayout> {
+    let popover = state.popover.as_ref()?;
+    let anchor = focus_rect(
+        ui,
+        match popover.kind {
+            PopKind::Mode => Hit::Mode,
+            PopKind::Rate => Hit::Rate,
+            PopKind::Rotation => Hit::Rotate,
+        },
+    )?;
+    let (w, h) = (i32::from(w), i32::from(h));
+    let width = i32::from(anchor.width).max(220).min(w - 8);
+    let below = i32::from(anchor.y) + i32::from(anchor.height) + 2;
+    let above = i32::from(anchor.y) - 2;
+    let room_below = h - 4 - below;
+    let room_above = above - 4;
+    let room = room_below.max(room_above);
+    let fit = ((room - 8) / i32::from(POP_ROW_H)).max(1) as usize;
+    let visible = popover.items.len().min(POP_ROWS).min(fit);
+    let height = visible as i32 * i32::from(POP_ROW_H) + 8;
+    let y = if room_below >= height || room_below >= room_above {
+        below
+    } else {
+        above - height
+    };
+    let x = i32::from(anchor.x).clamp(4, (w - width - 4).max(4));
+    let first = popover
+        .scroll
+        .min(popover.items.len().saturating_sub(visible))
+        .max((popover.cursor + 1).saturating_sub(visible))
+        .min(popover.cursor);
+    let rect = rect(x as i16, y as i16, width, height);
+    let rows = (first..first + visible)
+        .map(|index| {
+            (
+                index,
+                Rectangle {
+                    x: rect.x + 4,
+                    y: rect.y + 4 + ((index - first) as i16) * POP_ROW_H,
+                    width: rect.width.saturating_sub(8),
+                    height: POP_ROW_H as u16,
+                },
+            )
+        })
+        .collect();
+    Some(PopLayout { rect, rows })
+}
+
 fn hit(state: &State, ui: &Ui, x: i16, y: i16) -> Option<Hit> {
     if state.name_mode.is_some() {
         return Some(Hit::NameField);
     }
     if state.confirm.is_some() || ui.l.too_small {
         return None;
+    }
+    if state.popover.is_some() {
+        // Only the list's own rows react while it is open.
+        let w = (i32::from(ui.l.footer.x) * 2 + i32::from(ui.l.footer.width)) as u16;
+        let h = (i32::from(ui.l.footer.y) + i32::from(ui.l.footer.height)) as u16;
+        return popover_layout(state, ui, w, h).and_then(|layout| {
+            layout
+                .rows
+                .iter()
+                .find(|(_, row)| contains(*row, x, y))
+                .map(|(index, _)| Hit::PopItem(*index))
+        });
     }
     // D6: scrolled-out controls cannot be hit through the header or footer.
     if let Some(viewport) = ui.l.viewport {
@@ -2252,10 +2579,8 @@ fn hit(state: &State, ui: &Ui, x: i16, y: i16) -> Option<Hit> {
         (ui.panel.enabled, Hit::Enabled),
         (ui.panel.rotate, Hit::Rotate),
         (ui.panel.identify, Hit::Identify),
-        (ui.panel.mode_prev, Hit::ModePrev),
-        (ui.panel.mode_next, Hit::ModeNext),
-        (ui.panel.rate_prev, Hit::RatePrev),
-        (ui.panel.rate_next, Hit::RateNext),
+        (ui.panel.mode, Hit::Mode),
+        (ui.panel.rate, Hit::Rate),
         (ui.panel.single, Hit::Single),
         (ui.panel.extend, Hit::Extend),
         (ui.panel.mirror, Hit::Mirror),
@@ -2327,10 +2652,9 @@ fn focus_rect(ui: &Ui, focus: Hit) -> Option<Rectangle> {
         Hit::Enabled => Some(ui.panel.enabled),
         Hit::Rotate => Some(ui.panel.rotate),
         Hit::Identify => Some(ui.panel.identify),
-        Hit::ModePrev => Some(ui.panel.mode_prev),
-        Hit::ModeNext => Some(ui.panel.mode_next),
-        Hit::RatePrev => Some(ui.panel.rate_prev),
-        Hit::RateNext => Some(ui.panel.rate_next),
+        Hit::Mode => Some(ui.panel.mode),
+        Hit::Rate => Some(ui.panel.rate),
+        Hit::PopItem(_) => None,
         Hit::Single => Some(ui.panel.single),
         Hit::Extend => Some(ui.panel.extend),
         Hit::Mirror => Some(ui.panel.mirror),
@@ -2370,10 +2694,8 @@ fn focus_order(ui: &Ui) -> Vec<Hit> {
         Hit::Enabled,
         Hit::Rotate,
         Hit::Identify,
-        Hit::ModePrev,
-        Hit::ModeNext,
-        Hit::RatePrev,
-        Hit::RateNext,
+        Hit::Mode,
+        Hit::Rate,
         Hit::Single,
         Hit::Extend,
         Hit::Mirror,
@@ -3383,6 +3705,7 @@ impl App {
         if let Some(viewport) = ui.l.viewport {
             self.paint_scrollbar(viewport, ui.l.max_scroll)?;
         }
+        self.paint_popover(state, ui)?;
         if state.name_mode.is_some() {
             self.paint_name(state)?;
         } else if state.confirm.is_some() {
@@ -3423,6 +3746,78 @@ impl App {
             self.paint_name(state)?;
         }
         let _ = ui;
+        Ok(())
+    }
+
+    /// U1: the open mode, rate or rotation list.
+    fn paint_popover(&self, state: &State, ui: &Ui) -> Result<(), String> {
+        let (Some(popover), Some(layout)) =
+            (&state.popover, popover_layout(state, ui, self.w, self.h))
+        else {
+            return Ok(());
+        };
+        self.fill(self.palette.background, layout.rect)?;
+        self.outline(layout.rect, 1, self.palette.accent)?;
+        let check = if self.font.has('\u{2713}') {
+            "\u{2713}"
+        } else {
+            "*"
+        };
+        for (index, row) in &layout.rows {
+            let Some(item) = popover.items.get(*index) else {
+                continue;
+            };
+            let bg = if *index == popover.cursor {
+                theme::Palette::blend(self.palette.background, self.palette.accent, 0.35)
+            } else if self.hover == Some(Hit::PopItem(*index)) {
+                theme::Palette::blend(self.palette.background, self.palette.foreground, 0.08)
+            } else {
+                self.palette.background
+            };
+            self.fill(bg, *row)?;
+            let y = row.y + 4;
+            if item.checked {
+                self.label_on(row.x + 6, y, check, self.palette.accent, bg, 13.0)?;
+            }
+            self.label_fit(
+                row.x + 24,
+                y,
+                &item.label,
+                self.palette.foreground,
+                bg,
+                13.0,
+                f32::from(row.width) - 30.0,
+            )?;
+            if let Some(note) = item.note {
+                let width = self.text_width(note, 10.0).ceil() as i16;
+                self.label_on(
+                    row.x + i16::try_from(row.width).unwrap_or(0) - width - 8,
+                    y + 2,
+                    note,
+                    self.palette.muted,
+                    bg,
+                    10.0,
+                )?;
+            }
+        }
+        // More entries than rows: a small marker at the edge that has more.
+        let first = layout.rows.first().map(|(index, _)| *index).unwrap_or(0);
+        let last = layout.rows.last().map(|(index, _)| *index).unwrap_or(0);
+        let marker = |y: i16| Rectangle {
+            x: layout.rect.x + i16::try_from(layout.rect.width).unwrap_or(0) - 5,
+            y,
+            width: 2,
+            height: 8,
+        };
+        if first > 0 {
+            self.fill(self.palette.muted, marker(layout.rect.y + 3))?;
+        }
+        if last + 1 < popover.items.len() {
+            self.fill(
+                self.palette.muted,
+                marker(layout.rect.y + i16::try_from(layout.rect.height).unwrap_or(0) - 11),
+            )?;
+        }
         Ok(())
     }
 
@@ -3893,12 +4288,17 @@ impl App {
         self.button(
             panel.rotate,
             &format!(
-                "Rotate: {}",
+                "Rotate: {}{}",
                 selected
                     .map(|output| output.rotation.as_str())
-                    .unwrap_or("normal")
+                    .unwrap_or("normal"),
+                if self.font.has('\u{25be}') {
+                    " \u{25be}"
+                } else {
+                    " v"
+                }
             ),
-            false,
+            state.popover.as_ref().map(|p| p.kind) == Some(PopKind::Rotation),
             enabled,
             self.palette.surface,
         )?;
@@ -3909,31 +4309,35 @@ impl App {
             true,
             self.palette.surface,
         )?;
+        let arrow = if self.font.has('\u{25be}') {
+            " \u{25be}"
+        } else {
+            " v"
+        };
         self.button(
-            panel.mode_prev,
-            "Mode -",
-            false,
+            panel.mode,
+            &format!(
+                "{}{arrow}",
+                selected
+                    .filter(|output| output.enabled)
+                    .map(|output| output.mode.as_str())
+                    .unwrap_or("Mode")
+            ),
+            state.popover.as_ref().map(|p| p.kind) == Some(PopKind::Mode),
             enabled,
             self.palette.surface,
         )?;
         self.button(
-            panel.mode_next,
-            "Mode +",
-            false,
-            enabled,
-            self.palette.surface,
-        )?;
-        self.button(
-            panel.rate_prev,
-            "Rate -",
-            false,
-            enabled,
-            self.palette.surface,
-        )?;
-        self.button(
-            panel.rate_next,
-            "Rate +",
-            false,
+            panel.rate,
+            &format!(
+                "{}{arrow}",
+                selected
+                    .filter(|output| output.enabled)
+                    .and_then(|output| output.rate)
+                    .map(|rate| format!("{rate:.2} Hz"))
+                    .unwrap_or_else(|| "Rate".into())
+            ),
+            state.popover.as_ref().map(|p| p.kind) == Some(PopKind::Rate),
             enabled,
             self.palette.surface,
         )?;
@@ -4361,6 +4765,7 @@ impl App {
             "Preview      changes stay for 15 s; Keep confirms, Revert restores",
             "Screens      click the < > buttons or use the wheel to page",
             "Canvas       wheel zooms; middle-drag pans; 0 resets the view",
+            "Mode/Rate    click or Enter lists the choices; left/right step through them",
         ];
         let spacing = ((i32::from(rect.height) - 70) / lines.len() as i32).clamp(14, 22) as i16;
         for (index, line) in lines.iter().enumerate() {
@@ -4820,6 +5225,10 @@ fn handle_event(
                 lp.help = false;
                 return Ok(());
             }
+            if state.popover.is_some() {
+                state.popover_key(key);
+                return Ok(());
+            }
             if layout(app.w, app.h).too_small && !matches!(key, K_ESCAPE | K_Q) {
                 // Nothing is drawn to act on; only closing works.
                 return Ok(());
@@ -4924,6 +5333,21 @@ fn handle_event(
                 return Ok(());
             }
             let ui = app.ui(state);
+            if state.popover.is_some() {
+                // U1: a click on a row chooses it; the wheel scrolls the
+                // list; any other click closes it.
+                match (e.detail, hit(state, &ui, e.event_x, e.event_y)) {
+                    (1, Some(Hit::PopItem(index))) => state.choose_popover(index),
+                    (4, _) => {
+                        state.popover_key(K_UP);
+                    }
+                    (5, _) => {
+                        state.popover_key(K_DOWN);
+                    }
+                    _ => state.popover = None,
+                }
+                return Ok(());
+            }
             if e.detail == 4 || e.detail == 5 {
                 let up = e.detail == 4;
                 let over_canvas = contains(ui.l.canvas, e.event_x, e.event_y);
@@ -5059,6 +5483,9 @@ fn request_close(state: &mut State) {
     if state.confirm.is_some() {
         return;
     }
+    if state.popover.take().is_some() {
+        return;
+    }
     // D9: closing never reverts a preview without asking. A crash or a
     // kill still reverts through niructl's watchdog.
     if state.preview_active() {
@@ -5117,13 +5544,18 @@ fn page_profiles(state: &mut State, ui: &Ui, direction: i32) {
 
 fn handle_arrows(state: &mut State, ui: &Ui, key: u32, step: i32) {
     match state.focus {
-        Some(Hit::ModePrev) | Some(Hit::ModeNext) => {
+        // U1 keeps the left/right shortcuts on the focused list buttons.
+        Some(Hit::Mode) => {
             let delta = if matches!(key, K_LEFT | K_UP) { -1 } else { 1 };
             state.cycle_mode(delta);
         }
-        Some(Hit::RatePrev) | Some(Hit::RateNext) => {
+        Some(Hit::Rate) => {
             let delta = if matches!(key, K_LEFT | K_UP) { -1 } else { 1 };
             state.cycle_rate(delta);
+        }
+        Some(Hit::Rotate) => {
+            let delta = if matches!(key, K_LEFT | K_UP) { -1 } else { 1 };
+            state.cycle_rotation(delta);
         }
         Some(Hit::Output(_)) => match key {
             K_UP => {
@@ -5339,24 +5771,11 @@ fn activate(app: &mut App, state: &mut State, ui: &Ui, action: Hit) -> Result<()
             state.set_primary();
             Ok(())
         }
-        Hit::Rotate => {
-            state.rotate();
-            Ok(())
-        }
-        Hit::ModePrev => {
-            state.cycle_mode(-1);
-            Ok(())
-        }
-        Hit::ModeNext => {
-            state.cycle_mode(1);
-            Ok(())
-        }
-        Hit::RatePrev => {
-            state.cycle_rate(-1);
-            Ok(())
-        }
-        Hit::RateNext => {
-            state.cycle_rate(1);
+        Hit::Rotate => state.open_popover(PopKind::Rotation),
+        Hit::Mode => state.open_popover(PopKind::Mode),
+        Hit::Rate => state.open_popover(PopKind::Rate),
+        Hit::PopItem(index) => {
+            state.choose_popover(index);
             Ok(())
         }
         Hit::Single => {
@@ -5508,10 +5927,8 @@ mod tests {
             ui.panel.enabled,
             ui.panel.rotate,
             ui.panel.identify,
-            ui.panel.mode_prev,
-            ui.panel.mode_next,
-            ui.panel.rate_prev,
-            ui.panel.rate_next,
+            ui.panel.mode,
+            ui.panel.rate,
             ui.panel.single,
             ui.panel.extend,
             ui.panel.mirror,
@@ -5922,10 +6339,8 @@ mod tests {
             ui.panel.enabled,
             ui.panel.rotate,
             ui.panel.identify,
-            ui.panel.mode_prev,
-            ui.panel.mode_next,
-            ui.panel.rate_prev,
-            ui.panel.rate_next,
+            ui.panel.mode,
+            ui.panel.rate,
             ui.panel.single,
             ui.panel.extend,
             ui.panel.mirror,
@@ -6097,5 +6512,123 @@ mod tests {
         assert!(state.message.contains("needs HDMI-1"));
         assert!(state.select_profile(1));
         assert_eq!(state.selected_profile, Some(1));
+    }
+
+    fn popover_state() -> State {
+        let mut state = state_with(vec![
+            output("a", 0, 0, "1920x1080"),
+            output("b", 1920, 0, "1920x1080"),
+        ]);
+        state.draft[0].primary = true;
+        let mut a = output_state(
+            "a",
+            &[
+                ("1920x1080", &[60.0, 50.0]),
+                ("3840x2160", &[30.0]),
+                ("1280x720", &[60.0]),
+                ("2560x1440", &[59.95, 143.91]),
+            ],
+        );
+        a.modes[1].preferred = true;
+        state.status.outputs = vec![a, output_state("b", &[("1920x1080", &[60.0])])];
+        state
+    }
+
+    fn labels(state: &State) -> Vec<String> {
+        state
+            .popover
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|item| item.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn the_mode_list_is_sorted_by_size_and_keyboard_driven() {
+        let mut state = popover_state();
+        state.open_popover(PopKind::Mode).unwrap();
+        assert_eq!(state.focus, Some(Hit::Mode));
+        assert_eq!(
+            labels(&state),
+            vec!["3840x2160", "2560x1440", "1920x1080", "1280x720"]
+        );
+        let popover = state.popover.as_ref().unwrap();
+        assert_eq!(popover.items[0].note, Some("preferred"));
+        assert!(popover.items[2].checked, "the current mode is checked");
+        assert_eq!(popover.cursor, 2, "the cursor starts on the current mode");
+        // Up moves, Enter chooses and closes; the rate follows the mode.
+        assert!(state.popover_key(K_UP));
+        assert!(state.popover_key(K_RETURN));
+        assert!(state.popover.is_none());
+        assert_eq!(state.draft[0].mode, "2560x1440");
+        assert_eq!(state.draft[0].rate, Some(59.95));
+        assert!(state.dirty);
+        // Esc closes without a change.
+        state.open_popover(PopKind::Mode).unwrap();
+        state.popover_key(K_HOME);
+        assert!(state.popover_key(K_ESCAPE));
+        assert!(state.popover.is_none());
+        assert_eq!(state.draft[0].mode, "2560x1440");
+        // Rates for the chosen mode, highest first.
+        state.open_popover(PopKind::Rate).unwrap();
+        assert_eq!(labels(&state), vec!["143.91 Hz", "59.95 Hz"]);
+        state.popover_key(K_UP);
+        state.popover_key(K_SPACE);
+        assert_eq!(state.draft[0].rate, Some(143.91));
+        // Rotation lists four entries.
+        state.open_popover(PopKind::Rotation).unwrap();
+        assert_eq!(labels(&state), vec!["normal", "left", "inverted", "right"]);
+        state.popover_key(K_END);
+        state.popover_key(K_RETURN);
+        assert_eq!(state.draft[0].rotation, "right");
+        // Ctrl+Z undoes a list choice like any other edit.
+        state.undo();
+        assert_eq!(state.draft[0].rotation, "normal");
+        // Left/right on the focused buttons still cycle.
+        let ui = Ui::new(&state, MIN_WIDTH, MIN_HEIGHT, None, 1.0, (0.0, 0.0));
+        state.focus = Some(Hit::Rotate);
+        handle_arrows(&mut state, &ui, K_RIGHT, 1);
+        assert_eq!(state.draft[0].rotation, "left");
+    }
+
+    #[test]
+    fn a_mirror_group_lists_only_common_modes_and_the_list_fits_the_window() {
+        let mut state = popover_state();
+        state.draft[1].x = 0;
+        state.open_popover(PopKind::Mode).unwrap();
+        assert_eq!(labels(&state), vec!["1920x1080"]);
+        state.popover = None;
+        state.open_popover(PopKind::Rate).unwrap();
+        assert_eq!(labels(&state), vec!["60.00 Hz"]);
+        // A long list scrolls with the cursor and stays inside the window.
+        let modes: Vec<(String, Vec<f64>)> = (0..30)
+            .map(|i| (format!("{}x{}", 800 + i * 40, 600 + i * 20), vec![60.0]))
+            .collect();
+        let refs: Vec<(&str, &[f64])> = modes
+            .iter()
+            .map(|(m, r)| (m.as_str(), r.as_slice()))
+            .collect();
+        let mut state = state_with(vec![output("a", 0, 0, "800x600")]);
+        state.status.outputs = vec![output_state("a", &refs)];
+        state.open_popover(PopKind::Mode).unwrap();
+        state.popover_key(K_END);
+        for (w, h) in [(MIN_WIDTH, MIN_HEIGHT), (560, 420)] {
+            let ui = Ui::new(&state, w, h, None, 1.0, (0.0, 0.0));
+            let layout = popover_layout(&state, &ui, w, h).unwrap();
+            assert!(layout.rows.iter().any(|(index, _)| *index == 29), "{w}x{h}");
+            assert!(layout.rows.len() <= POP_ROWS);
+            assert!(layout.rect.y >= 0);
+            assert!(i32::from(layout.rect.y) + i32::from(layout.rect.height) <= i32::from(h));
+            let (_, row) = layout.rows.last().unwrap();
+            assert_eq!(
+                hit(&state, &ui, row.x + 5, row.y + 5),
+                Some(Hit::PopItem(29))
+            );
+            assert_eq!(hit(&state, &ui, 2, 2), None, "outside closes, never acts");
+        }
+        state.popover_key(K_HOME);
+        assert_eq!(state.popover.as_ref().unwrap().scroll, 0);
     }
 }
