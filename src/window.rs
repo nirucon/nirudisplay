@@ -38,9 +38,12 @@ const PAD: i16 = 20;
 const HEADER: i16 = 76;
 const FOOTER: i16 = 58;
 const PANEL_W: i16 = 330;
-const PROFILE_H: i16 = 138;
+const PROFILE_H: i16 = 164;
 const ROW_H: i16 = 30;
-const PROFILE_PAGE: usize = 8;
+/// U3: one profile row: the name with its badges, then the summary.
+const PROFILE_ROW_H: i16 = 30;
+const PROFILE_ROW_GAP: i16 = 3;
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 
 const K_ESCAPE: u32 = 0xff1b;
 const K_TAB: u32 = 0xff09;
@@ -606,7 +609,7 @@ impl State {
             .iter()
             .position(|profile| profile.name == name);
         if let Some(index) = self.selected_profile {
-            self.profile_scroll = index / PROFILE_PAGE;
+            self.profile_scroll = index;
         }
     }
 
@@ -663,8 +666,9 @@ impl State {
     }
 
     fn clamp_scrolls(&mut self) {
-        let profile_pages = self.status.profiles.len().div_ceil(PROFILE_PAGE);
-        self.profile_scroll = self.profile_scroll.min(profile_pages.saturating_sub(1));
+        self.profile_scroll = self
+            .profile_scroll
+            .min(self.status.profiles.len().saturating_sub(1));
     }
 
     fn checkpoint(&mut self) {
@@ -1102,6 +1106,35 @@ impl State {
         }
     }
 
+    /// D10/U3: a click on a profile row selects it, and loads it into the
+    /// draft when every screen it needs is connected. A profile that cannot
+    /// be used here stays selectable for Rename, Delete and Use at login.
+    /// Returns true when the profile was loaded.
+    pub fn select_profile(&mut self, index: usize) -> bool {
+        let Some(profile) = self.status.profiles.get(index) else {
+            return false;
+        };
+        let missing = missing_outputs(&self.status, profile);
+        if missing.is_empty() {
+            match self.load_profile(index) {
+                Ok(()) => return true,
+                Err(err) => self.set_message(err, true),
+            }
+            return false;
+        }
+        let name = profile.name.clone();
+        self.selected_profile = Some(index);
+        self.profile_scroll = index;
+        self.set_message(
+            format!(
+                "{name} needs {}. Rename, Delete and Use at login still work.",
+                missing.join(", ")
+            ),
+            false,
+        );
+        false
+    }
+
     pub fn load_profile(&mut self, index: usize) -> Result<(), String> {
         let profile = self
             .status
@@ -1109,17 +1142,7 @@ impl State {
             .get(index)
             .cloned()
             .ok_or("unknown display profile")?;
-        let missing: Vec<String> = profile
-            .outputs
-            .iter()
-            .filter(|output| {
-                self.status
-                    .output(&output.name)
-                    .map(|state| !state.usable())
-                    .unwrap_or(true)
-            })
-            .map(|output| output.name.clone())
-            .collect();
+        let missing = missing_outputs(&self.status, &profile);
         if !missing.is_empty() {
             return Err(format!(
                 "{} is not connected; connect {} and try again",
@@ -1156,7 +1179,7 @@ impl State {
             .unwrap_or(0);
         self.selected_profile = Some(index);
         self.output_scroll = 0;
-        self.profile_scroll = index / PROFILE_PAGE;
+        self.profile_scroll = index;
         self.dirty = true;
         self.set_message(
             format!("Loaded {}. Apply to preview it.", profile.name),
@@ -1295,6 +1318,108 @@ impl State {
             After::Startup { enabled },
         );
         Ok(())
+    }
+}
+
+/// D10: the outputs a profile needs that are not connected and usable.
+pub fn missing_outputs(status: &backend::Status, profile: &backend::Profile) -> Vec<String> {
+    profile
+        .outputs
+        .iter()
+        .filter(|output| {
+            status
+                .output(&output.name)
+                .map(|state| !state.usable())
+                .unwrap_or(true)
+        })
+        .map(|output| output.name.clone())
+        .collect()
+}
+
+/// D10: true when the profile describes the running layout: the same
+/// enabled outputs with the same mode, position, rotation and primary, and
+/// the same rate where the profile names one.
+pub fn profile_is_current(profile: &backend::Profile, actual: &[DraftOutput]) -> bool {
+    let enabled: Vec<&DraftOutput> = actual.iter().filter(|output| output.enabled).collect();
+    if profile.outputs.is_empty() || profile.outputs.len() != enabled.len() {
+        return false;
+    }
+    let single = enabled.len() == 1;
+    profile.outputs.iter().all(|saved| {
+        let Some(output) = enabled.iter().find(|output| output.name == saved.name) else {
+            return false;
+        };
+        let rotation = if saved.rotation.is_empty() {
+            "normal"
+        } else {
+            saved.rotation.as_str()
+        };
+        saved.mode == output.mode
+            && rotation == output.rotation
+            && saved.position_pair() == Some((output.x, output.y))
+            && (single || saved.primary == output.primary)
+            && match (saved.rate, output.rate) {
+                (Some(left), Some(right)) => (left - right).abs() < 0.01,
+                (Some(_), None) => false,
+                (None, _) => true,
+            }
+    })
+}
+
+/// D10: "3 screens · eDP + 2× 2560x1440". A built-in panel is named by its
+/// connector type; external screens by their mode.
+pub fn profile_summary(profile: &backend::Profile) -> String {
+    let mut parts: Vec<(String, usize)> = Vec::new();
+    for output in &profile.outputs {
+        let kind = output.name.split('-').next().unwrap_or_default();
+        let label = if ["eDP", "LVDS", "DSI"]
+            .iter()
+            .any(|internal| kind.eq_ignore_ascii_case(internal))
+        {
+            kind.to_string()
+        } else if output.mode.is_empty() {
+            output.name.clone()
+        } else {
+            output.mode.clone()
+        };
+        match parts.iter_mut().find(|(candidate, _)| *candidate == label) {
+            Some((_, count)) => *count += 1,
+            None => parts.push((label, 1)),
+        }
+    }
+    let count = profile.outputs.len();
+    let list = parts
+        .into_iter()
+        .map(|(label, count)| {
+            if count > 1 {
+                format!("{count}\u{d7} {label}")
+            } else {
+                label
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    format!(
+        "{count} screen{} · {list}",
+        if count == 1 { "" } else { "s" }
+    )
+}
+
+/// What a profile row shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileInfo {
+    pub missing: Vec<String>,
+    pub current: bool,
+    pub startup: bool,
+    pub summary: String,
+}
+
+pub fn profile_info(status: &backend::Status, profile: &backend::Profile) -> ProfileInfo {
+    ProfileInfo {
+        missing: missing_outputs(status, profile),
+        current: profile_is_current(profile, &draft_from_status(status)),
+        startup: status.startup_profile.as_deref() == Some(profile.name.as_str()),
+        summary: profile_summary(profile),
     }
 }
 
@@ -1936,32 +2061,41 @@ struct ProfileLayout {
     actions: [Rectangle; 5],
     page: usize,
     pages: usize,
+    per_page: usize,
 }
 
 fn profile_layout(state: &State, l: Layout) -> ProfileLayout {
     let total = state.status.profiles.len();
-    let pages = total.div_ceil(PROFILE_PAGE).max(1);
-    let page = state.profile_scroll.min(pages.saturating_sub(1));
-    let start = page * PROFILE_PAGE;
-    let visible = (total.saturating_sub(start)).min(PROFILE_PAGE);
-    let columns = 4usize;
-    let width = (l.profiles.width.saturating_sub(18)) / columns as u16;
+    let actions_y = l.profiles.y + i16::try_from(l.profiles.height).unwrap_or(0) - 33;
+    let top = l.profiles.y + 28;
+    let step = PROFILE_ROW_H + PROFILE_ROW_GAP;
+    let per_column = (((actions_y - 4 - top + PROFILE_ROW_GAP) / step).max(1)) as usize;
+    let columns = if l.profiles.width >= 700 { 2usize } else { 1 };
+    let per_page = per_column * columns;
+    let pages = total.div_ceil(per_page).max(1);
+    let page = (state.profile_scroll / per_page).min(pages.saturating_sub(1));
+    let start = page * per_page;
+    let visible = (total.saturating_sub(start)).min(per_page);
+    let inner = l.profiles.width.saturating_sub(16);
+    let gap = 8u16;
+    let width = (inner.saturating_sub(gap * (columns as u16 - 1))) / columns as u16;
     let rows = (0..visible)
         .map(|slot| {
-            let column = slot % columns;
-            let row = slot / columns;
+            // Fill a column top to bottom, then the next one.
+            let column = slot / per_column;
+            let row = slot % per_column;
             (
                 start + slot,
                 Rectangle {
-                    x: l.profiles.x + column as i16 * i16::try_from(width + 4).unwrap_or(0),
-                    y: l.profiles.y + 30 + row as i16 * 31,
+                    x: l.profiles.x + 8 + column as i16 * i16::try_from(width + gap).unwrap_or(0),
+                    y: top + row as i16 * step,
                     width,
-                    height: 27,
+                    height: PROFILE_ROW_H as u16,
                 },
             )
         })
         .collect();
-    let (prev, next) = if total > PROFILE_PAGE {
+    let (prev, next) = if total > per_page {
         (
             Some(Rectangle {
                 x: l.profiles.x + i16::try_from(l.profiles.width).unwrap_or(0) - 52,
@@ -1982,7 +2116,7 @@ fn profile_layout(state: &State, l: Layout) -> ProfileLayout {
     let action_width = (l.profiles.width.saturating_sub(24)) / 5;
     let actions = std::array::from_fn(|index| Rectangle {
         x: l.profiles.x + index as i16 * i16::try_from(action_width + 4).unwrap_or(0),
-        y: l.profiles.y + i16::try_from(l.profiles.height).unwrap_or(0) - 33,
+        y: actions_y,
         width: action_width,
         height: 27,
     });
@@ -1993,6 +2127,7 @@ fn profile_layout(state: &State, l: Layout) -> ProfileLayout {
         actions,
         page,
         pages,
+        per_page,
     }
 }
 
@@ -2332,6 +2467,8 @@ pub struct App {
     identify_until: Option<Instant>,
     /// D6: how far the compact layout is scrolled.
     scroll: i16,
+    /// The last click, for the profile double-click.
+    last_click: Option<(Hit, Instant)>,
     /// Painting is clipped to this (the compact viewport) when set.
     base_clip: std::cell::Cell<Option<Rectangle>>,
 }
@@ -2499,6 +2636,7 @@ impl App {
             overlays: Vec::new(),
             identify_until: None,
             scroll: 0,
+            last_click: None,
             base_clip: std::cell::Cell::new(None),
         })
     }
@@ -3940,13 +4078,10 @@ impl App {
             let Some(profile) = state.status.profiles.get(*index) else {
                 continue;
             };
+            let info = profile_info(&state.status, profile);
             let selected = state.selected_profile == Some(*index);
-            let startup = state.status.startup_profile.as_deref() == Some(profile.name.as_str());
-            let mut label = format!("{} ({})", profile.name, profile.outputs.len());
-            if startup {
-                label.push_str(" · login");
-            }
-            self.button(*rect, &label, selected, true, self.palette.surface)?;
+            let hovered = self.hover == Some(Hit::Profile(*index));
+            self.paint_profile_row(*rect, &profile.name, &info, selected, hovered)?;
         }
         let startup_selected = state
             .selected_profile
@@ -3978,6 +4113,96 @@ impl App {
             )?;
         }
         Ok(())
+    }
+
+    /// U3/D10: one profile row. The name and its badges ("current",
+    /// "at login") on the first line, the summary or what is missing on the
+    /// second. A profile that cannot be used here is dimmed.
+    fn paint_profile_row(
+        &self,
+        rect: Rectangle,
+        name: &str,
+        info: &ProfileInfo,
+        selected: bool,
+        hovered: bool,
+    ) -> Result<(), String> {
+        let usable = info.missing.is_empty();
+        let bg = if selected {
+            theme::Palette::blend(self.palette.surface, self.palette.accent, 0.28)
+        } else if hovered {
+            theme::Palette::blend(self.palette.background, self.palette.foreground, 0.07)
+        } else {
+            self.palette.background
+        };
+        self.fill(bg, rect)?;
+        self.outline(
+            rect,
+            1,
+            if selected {
+                self.palette.accent
+            } else {
+                self.palette.border
+            },
+        )?;
+        if selected {
+            self.fill(self.palette.accent, Rectangle { width: 2, ..rect })?;
+        }
+        // Badges from the right.
+        let mut right = rect.x + i16::try_from(rect.width).unwrap_or(0) - 6;
+        let mut badges: Vec<(&str, u32, u32)> = Vec::new();
+        if info.startup {
+            badges.push(("at login", self.palette.surface, self.palette.foreground));
+        }
+        if info.current {
+            badges.push(("current", self.palette.accent, self.palette.background));
+        }
+        for (text, fill, fg) in badges {
+            let width = self.text_width(text, 10.0).ceil() as u16 + 10;
+            if i32::from(right) - i32::from(width) < i32::from(rect.x) + 60 {
+                break;
+            }
+            right -= i16::try_from(width).unwrap_or(0);
+            let badge = Rectangle {
+                x: right,
+                y: rect.y + 3,
+                width,
+                height: 13,
+            };
+            self.fill(fill, badge)?;
+            self.label_fit(badge.x + 5, badge.y, text, fg, fill, 10.0, f32::from(width))?;
+            right -= 4;
+        }
+        let text_x = rect.x + 8;
+        self.label_fit(
+            text_x,
+            rect.y + 1,
+            name,
+            if usable {
+                self.palette.foreground
+            } else {
+                self.palette.muted
+            },
+            bg,
+            12.0,
+            f32::from(right - text_x - 4),
+        )?;
+        let (detail, colour) = if usable {
+            (info.summary.clone(), self.palette.muted)
+        } else {
+            (
+                format!("needs {}", info.missing.join(", ")),
+                theme::Palette::blend(bg, self.palette.warning(), 0.75),
+            )
+        };
+        self.label_fit(
+            text_x,
+            rect.y + 16,
+            &detail,
+            colour,
+            bg,
+            10.0,
+            f32::from(rect.width).max(1.0) - 16.0,
+        )
     }
 
     fn paint_name(&self, state: &State) -> Result<(), String> {
@@ -4132,7 +4357,7 @@ impl App {
             "Ctrl+Z       undo the last draft change",
             "F1           open or close this help",
             "Esc/Q        close; during a preview it asks: Keep layout or Revert",
-            "Profiles     click to load, then Preview; Save as… stores the draft",
+            "Profiles     click to load, double-click to preview; Save as… stores the draft",
             "Preview      changes stay for 15 s; Keep confirms, Revert restores",
             "Screens      click the < > buttons or use the wheel to page",
             "Canvas       wheel zooms; middle-drag pans; 0 resets the view",
@@ -4755,6 +4980,21 @@ fn handle_event(
                 return Ok(());
             }
             if let Some(action) = hit(state, &ui, e.event_x, e.event_y) {
+                let now = Instant::now();
+                let double = app.last_click.is_some_and(|(previous, at)| {
+                    previous == action && now.duration_since(at) <= DOUBLE_CLICK
+                });
+                app.last_click = Some((action, now));
+                if let (Hit::Profile(index), true) = (action, double) {
+                    // U3: a double-click loads the profile and previews it.
+                    app.last_click = None;
+                    if state.selected_profile == Some(index) && state.select_profile(index) {
+                        if let Err(err) = state.apply_preview() {
+                            state.set_message(err, true);
+                        }
+                    }
+                    return Ok(());
+                }
                 activate(app, state, &ui, action)?;
             }
         }
@@ -4869,9 +5109,10 @@ fn page_outputs(state: &mut State, ui: &Ui, direction: i32) {
 }
 
 fn page_profiles(state: &mut State, ui: &Ui, direction: i32) {
+    let per_page = ui.profiles.per_page.max(1) as i32;
     let pages = ui.profiles.pages as i32;
-    let page = state.profile_scroll as i32 + direction;
-    state.profile_scroll = page.clamp(0, pages.saturating_sub(1)) as usize;
+    let page = (ui.profiles.page as i32 + direction).clamp(0, pages.saturating_sub(1));
+    state.profile_scroll = (page * per_page) as usize;
 }
 
 fn handle_arrows(state: &mut State, ui: &Ui, key: u32, step: i32) {
@@ -5078,7 +5319,10 @@ fn activate(app: &mut App, state: &mut State, ui: &Ui, action: Hit) -> Result<()
             page_outputs(state, ui, 1);
             Ok(())
         }
-        Hit::Profile(index) => state.load_profile(index),
+        Hit::Profile(index) => {
+            state.select_profile(index);
+            Ok(())
+        }
         Hit::ProfilePrev => {
             page_profiles(state, ui, -1);
             Ok(())
@@ -5335,16 +5579,31 @@ mod tests {
         let first = Ui::new(&state, MIN_WIDTH, MIN_HEIGHT, None, 1.0, (0.0, 0.0));
         assert!(first.panel.rows.len() < 8);
         assert!(first.panel.page_next.is_some());
-        assert_eq!(first.profiles.rows.len(), 8);
+        let per_page = first.profiles.per_page;
+        assert!(per_page >= 4, "two columns of profile rows: {per_page}");
+        assert_eq!(first.profiles.rows.len(), per_page);
         assert!(first.profiles.next.is_some());
         state.output_scroll = 2;
-        state.profile_scroll = 1;
+        page_profiles(&mut state, &first, 1);
         let second = Ui::new(&state, MIN_WIDTH, MIN_HEIGHT, None, 1.0, (0.0, 0.0));
         assert_eq!(second.panel.rows.first().map(|(index, _)| *index), Some(2));
         assert_eq!(
             second.profiles.rows.first().map(|(index, _)| *index),
-            Some(8)
+            Some(per_page)
         );
+        // Every profile is on some page.
+        let mut seen = Vec::new();
+        state.profile_scroll = 0;
+        for _ in 0..second.profiles.pages {
+            let ui = Ui::new(&state, MIN_WIDTH, MIN_HEIGHT, None, 1.0, (0.0, 0.0));
+            seen.extend(ui.profiles.rows.iter().map(|(index, _)| *index));
+            page_profiles(&mut state, &ui, 1);
+        }
+        assert_eq!(seen, (0..11).collect::<Vec<_>>());
+        // Selecting a profile reveals its page.
+        state.profile_scroll = 10;
+        let ui = Ui::new(&state, MIN_WIDTH, MIN_HEIGHT, None, 1.0, (0.0, 0.0));
+        assert!(ui.profiles.rows.iter().any(|(index, _)| *index == 10));
     }
 
     #[test]
@@ -5762,5 +6021,81 @@ mod tests {
         let x = ui.l.canvas.x + 10;
         let y = viewport.y - 5;
         assert_eq!(hit(&state, &ui, x, y), None);
+    }
+
+    fn connected(name: &str) -> backend::OutputState {
+        output_state(name, &[("1920x1080", &[60.0]), ("2560x1440", &[59.95])])
+    }
+
+    #[test]
+    fn profiles_show_availability_current_login_and_a_summary() {
+        let mut status = backend::Status {
+            outputs: vec![connected("eDP-1"), connected("DisplayPort-1")],
+            startup_profile: Some("Desk".into()),
+            ..Default::default()
+        };
+        status.outputs[0].current = Some(backend::CurrentOutput {
+            mode: "1920x1080".into(),
+            rate: Some(60.0),
+            position: "0x0".into(),
+            rotation: "normal".into(),
+            primary: true,
+        });
+        status.outputs[0].primary = true;
+        status.outputs[1].active = false;
+        let desk = backend::Profile {
+            name: "Desk".into(),
+            outputs: ["eDP-1", "DisplayPort-7", "DisplayPort-8"]
+                .iter()
+                .enumerate()
+                .map(|(index, name)| backend::ProfileOutput {
+                    name: (*name).into(),
+                    mode: if index == 0 { "1920x1080" } else { "2560x1440" }.into(),
+                    rate: Some(60.0),
+                    position: backend::position_string(index as i32 * 2560, 0),
+                    rotation: "normal".into(),
+                    primary: index == 0,
+                })
+                .collect(),
+        };
+        let info = profile_info(&status, &desk);
+        assert_eq!(info.missing, vec!["DisplayPort-7", "DisplayPort-8"]);
+        assert_eq!(info.summary, "3 screens · eDP + 2\u{d7} 2560x1440");
+        assert!(info.startup && !info.current);
+        // The running layout: only eDP-1 at 1920x1080.
+        let laptop = profile("Laptop", &["eDP-1"]);
+        let info = profile_info(&status, &laptop);
+        assert!(info.missing.is_empty() && info.current && !info.startup);
+        assert_eq!(info.summary, "1 screen · eDP");
+        // A different mode, position or an extra screen is not current.
+        let mut moved = laptop.clone();
+        moved.outputs[0].position = "10x0".into();
+        assert!(!profile_info(&status, &moved).current);
+        let both = profile("Both", &["eDP-1", "DisplayPort-1"]);
+        let info = profile_info(&status, &both);
+        assert!(info.missing.is_empty() && !info.current);
+        assert_eq!(info.summary, "2 screens · eDP + 1920x1080");
+        // A profile without a rate matches any rate.
+        let mut any_rate = laptop;
+        any_rate.outputs[0].rate = None;
+        assert!(profile_info(&status, &any_rate).current);
+    }
+
+    #[test]
+    fn an_unusable_profile_is_selected_but_not_loaded() {
+        let mut state = state_with(Vec::new());
+        state.status = backend::Status {
+            outputs: vec![connected("eDP-1")],
+            profiles: vec![profile("TV", &["HDMI-1"]), profile("Laptop", &["eDP-1"])],
+            ..Default::default()
+        };
+        state.draft = draft_from_status(&state.status);
+        let before = state.draft.clone();
+        assert!(!state.select_profile(0));
+        assert_eq!(state.selected_profile, Some(0), "Rename/Delete still work");
+        assert_eq!(state.draft, before, "the draft is untouched");
+        assert!(state.message.contains("needs HDMI-1"));
+        assert!(state.select_profile(1));
+        assert_eq!(state.selected_profile, Some(1));
     }
 }
