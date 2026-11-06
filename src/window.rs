@@ -99,6 +99,8 @@ pub enum Hit {
     Profile(usize),
     ProfilePrev,
     ProfileNext,
+    /// Automatic switching on or off.
+    Automatic,
     NameField,
 }
 
@@ -296,6 +298,9 @@ pub enum After {
     Startup {
         enabled: bool,
     },
+    Automatic {
+        enabled: bool,
+    },
 }
 
 impl After {
@@ -319,6 +324,8 @@ impl After {
             After::Rename { .. } => "Renaming the profile…",
             After::Delete { .. } => "Deleting the profile…",
             After::Startup { .. } => "Updating the login profile…",
+            After::Automatic { enabled: true } => "Turning automatic switching on…",
+            After::Automatic { enabled: false } => "Turning automatic switching off…",
         }
     }
 }
@@ -643,6 +650,21 @@ impl State {
                 if !failed {
                     self.selected_profile = None;
                     self.set_message(format!("Deleted display profile {name}."), false);
+                }
+            }
+            After::Automatic { enabled } => {
+                if let Some(status) = status {
+                    self.apply_status(status, false);
+                }
+                if !failed {
+                    self.set_message(
+                        if enabled {
+                            "Automatic switching on: the layout follows the connected screens and the lid."
+                        } else {
+                            "Automatic switching off: layouts change only when you apply them."
+                        },
+                        false,
+                    );
                 }
             }
             After::Startup { enabled } => {
@@ -1380,8 +1402,10 @@ impl State {
                     position: backend::position_string(output.x, output.y),
                     rotation: output.rotation.clone(),
                     primary: output.primary,
+                    label: None,
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -1583,6 +1607,40 @@ impl State {
         Ok(())
     }
 
+    /// Whether niructl offers automatic switching (0.17 and later).
+    pub fn automatic_supported(&self) -> bool {
+        self.status.automatic.is_some()
+    }
+
+    pub fn automatic_enabled(&self) -> bool {
+        self.status
+            .automatic
+            .as_ref()
+            .is_some_and(|auto| auto.enabled)
+    }
+
+    /// The screens show a layout the automation made, not a saved profile:
+    /// what the header offers to save.
+    pub fn automatic_layout(&self) -> Option<&str> {
+        let auto = self.status.automatic.as_ref()?;
+        if self.dirty || auto.current_profile.is_some() {
+            return None;
+        }
+        auto.automatic_layout.as_deref()
+    }
+
+    pub fn toggle_automatic(&mut self) -> Result<(), String> {
+        if !self.automatic_supported() {
+            return Err("This niructl has no automatic switching; update NIRUX.".into());
+        }
+        let enabled = !self.automatic_enabled();
+        self.submit(
+            backend::Job::Automatic { enabled },
+            After::Automatic { enabled },
+        );
+        Ok(())
+    }
+
     /// Toggle "Use at login" for the selected profile.
     pub fn toggle_startup(&mut self) -> Result<(), String> {
         let name = self
@@ -1601,7 +1659,19 @@ impl State {
 }
 
 /// D10: the outputs a profile needs that are not connected and usable.
+/// niructl 0.17+ matches screens by identity and says whether the profile can
+/// be loaded; its answer wins over comparing connector names.
 pub fn missing_outputs(status: &backend::Status, profile: &backend::Profile) -> Vec<String> {
+    if profile.loadable == Some(false) {
+        return vec![profile
+            .reason
+            .clone()
+            .map(|reason| reason.trim_start_matches("needs ").to_string())
+            .unwrap_or_else(|| "a screen that is not connected".into())];
+    }
+    if profile.loadable == Some(true) {
+        return Vec::new();
+    }
     profile
         .outputs
         .iter()
@@ -1691,14 +1761,44 @@ pub struct ProfileInfo {
     pub current: bool,
     pub startup: bool,
     pub summary: String,
+    /// niructl's explanation when the profile does not fit, e.g. "needs HPN
+    /// HP E27q G5 (serial …2MRJ)" or "also connected: HDMI-1".
+    pub reason: Option<String>,
+    /// The automation applied this profile and it is what the screens show.
+    pub auto_applied: bool,
+    /// `auto = false`: never chosen automatically.
+    pub manual_only: bool,
 }
 
 pub fn profile_info(status: &backend::Status, profile: &backend::Profile) -> ProfileInfo {
+    let current = profile_is_current(profile, &draft_from_status(status));
+    // niructl matches by screen identity, so its verdict wins; an older
+    // niructl only lets us compare connector names.
+    let missing = match profile.fit.as_deref() {
+        // The reason names the screens by identity ("needs HPN HP E27q G5
+        // (serial …2MRJ)", "the built-in screen (the lid is closed)").
+        Some("missing") => vec![profile
+            .reason
+            .clone()
+            .unwrap_or_else(|| "a screen that is not connected".into())],
+        Some(_) => Vec::new(),
+        None => missing_outputs(status, profile),
+    };
+    let auto_applied = status.automatic.as_ref().is_some_and(|auto| {
+        auto.enabled
+            && current
+            && auto.last.as_ref().is_some_and(|last| {
+                last.action == "profile" && last.profile.as_deref() == Some(profile.name.as_str())
+            })
+    });
     ProfileInfo {
-        missing: missing_outputs(status, profile),
-        current: profile_is_current(profile, &draft_from_status(status)),
+        missing,
+        current,
         startup: status.startup_profile.as_deref() == Some(profile.name.as_str()),
         summary: profile_summary(profile),
+        reason: profile.reason.clone(),
+        auto_applied,
+        manual_only: !profile.auto,
     }
 }
 
@@ -2326,11 +2426,17 @@ struct ProfileLayout {
     rows: Vec<(usize, Rectangle)>,
     prev: Option<Rectangle>,
     next: Option<Rectangle>,
+    /// The automatic-switching toggle in the header; None with an older
+    /// niructl that has no automation.
+    automatic: Option<Rectangle>,
     actions: [Rectangle; 5],
     page: usize,
     pages: usize,
     per_page: usize,
 }
+
+/// Width of the "Automatic: on/off" toggle.
+const AUTOMATIC_W: u16 = 116;
 
 fn profile_layout(state: &State, l: Layout) -> ProfileLayout {
     let total = state.status.profiles.len();
@@ -2381,6 +2487,16 @@ fn profile_layout(state: &State, l: Layout) -> ProfileLayout {
     } else {
         (None, None)
     };
+    let automatic = state.automatic_supported().then(|| {
+        let right = l.profiles.x + i16::try_from(l.profiles.width).unwrap_or(0)
+            - if prev.is_some() { 58 } else { 4 };
+        Rectangle {
+            x: right - AUTOMATIC_W as i16,
+            y: l.profiles.y + 2,
+            width: AUTOMATIC_W,
+            height: 20,
+        }
+    });
     let action_width = (l.profiles.width.saturating_sub(24)) / 5;
     let actions = std::array::from_fn(|index| Rectangle {
         x: l.profiles.x + index as i16 * i16::try_from(action_width + 4).unwrap_or(0),
@@ -2392,6 +2508,7 @@ fn profile_layout(state: &State, l: Layout) -> ProfileLayout {
         rows,
         prev,
         next,
+        automatic,
         actions,
         page,
         pages,
@@ -2654,6 +2771,11 @@ fn hit(state: &State, ui: &Ui, x: i16, y: i16) -> Option<Hit> {
             return Some(Hit::ProfileNext);
         }
     }
+    if let Some(rect) = ui.profiles.automatic {
+        if contains(rect, x, y) {
+            return Some(Hit::Automatic);
+        }
+    }
     for (index, action) in [
         Hit::Save,
         Hit::Rename,
@@ -2714,6 +2836,7 @@ fn focus_rect(ui: &Ui, focus: Hit) -> Option<Rectangle> {
             .map(|(_, rect)| *rect),
         Hit::ProfilePrev => ui.profiles.prev,
         Hit::ProfileNext => ui.profiles.next,
+        Hit::Automatic => ui.profiles.automatic,
         Hit::Save => Some(ui.profiles.actions[0]),
         Hit::Rename => Some(ui.profiles.actions[1]),
         Hit::Delete => Some(ui.profiles.actions[2]),
@@ -2757,6 +2880,9 @@ fn focus_order(ui: &Ui) -> Vec<Hit> {
     if ui.profiles.prev.is_some() {
         out.push(Hit::ProfilePrev);
         out.push(Hit::ProfileNext);
+    }
+    if ui.profiles.automatic.is_some() {
+        out.push(Hit::Automatic);
     }
     out.extend([
         Hit::Save,
@@ -4620,6 +4746,61 @@ impl App {
         if let Some(rect) = layout.next {
             self.button(rect, ">", false, true, self.palette.surface)?;
         }
+        if let Some(rect) = layout.automatic {
+            let on = state.automatic_enabled();
+            self.button(
+                rect,
+                if on {
+                    "Automatic: on"
+                } else {
+                    "Automatic: off"
+                },
+                on,
+                disabled_reason(state, Hit::Automatic).is_none(),
+                self.palette.surface,
+            )?;
+            // Between the title (and page count) and the toggle: what the
+            // automation is doing, or an offer to keep its layout.
+            let left = ui.l.profiles.x + if layout.pages > 1 { 112 } else { 78 };
+            let width = f32::from((rect.x - 8 - left).max(0) as u16);
+            let notice = if let Some(screens) = state.automatic_layout() {
+                Some((
+                    format!("Automatic layout ({screens}) \u{2014} save as profile?"),
+                    self.palette.foreground,
+                ))
+            } else {
+                state.status.automatic.as_ref().and_then(|auto| {
+                    if !auto.ambiguous.is_empty() {
+                        Some((
+                            format!("{} fit these screens: pick one", auto.ambiguous.join(", ")),
+                            self.palette.warning(),
+                        ))
+                    } else if auto.retry_in.is_some() {
+                        Some((
+                            "A screen refused its saved mode; retrying".to_string(),
+                            self.palette.warning(),
+                        ))
+                    } else if auto.enabled && auto.lid.as_deref() == Some("closed") {
+                        Some(("Lid closed".to_string(), self.palette.muted))
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some((text, colour)) = notice {
+                if width > 40.0 {
+                    self.label_fit(
+                        left,
+                        ui.l.profiles.y + 7,
+                        &text,
+                        colour,
+                        self.palette.surface,
+                        10.0,
+                        width,
+                    )?;
+                }
+            }
+        }
         if state.status.profiles.is_empty() {
             self.label(
                 ui.l.profiles.x + 8,
@@ -4649,7 +4830,7 @@ impl App {
             "Use at login"
         };
         for (index, text, active) in [
-            (0, "Save as…", false),
+            (0, "Save as…", state.automatic_layout().is_some()),
             (1, "Rename", false),
             (2, "Delete", false),
             (3, startup_text, startup_selected),
@@ -4712,8 +4893,18 @@ impl App {
         // Badges from the right.
         let mut right = rect.x + i16::try_from(rect.width).unwrap_or(0) - 6;
         let mut badges: Vec<(&str, u32, u32)> = Vec::new();
+        if info.manual_only {
+            badges.push(("manual", self.palette.background, self.palette.muted));
+        }
         if info.startup {
             badges.push(("at login", self.palette.surface, self.palette.foreground));
+        }
+        if info.auto_applied {
+            badges.push((
+                "auto",
+                theme::Palette::blend(self.palette.background, self.palette.accent, 0.45),
+                self.palette.foreground,
+            ));
         }
         if info.current {
             badges.push(("current", self.palette.accent, self.palette.background));
@@ -4752,7 +4943,9 @@ impl App {
             (info.summary.clone(), self.palette.muted)
         } else {
             (
-                format!("needs {}", info.missing.join(", ")),
+                info.reason
+                    .clone()
+                    .unwrap_or_else(|| format!("needs {}", info.missing.join(", "))),
                 theme::Palette::blend(bg, self.palette.warning(), 0.75),
             )
         };
@@ -5973,10 +6166,12 @@ fn activate(app: &mut App, state: &mut State, ui: &Ui, action: Hit) -> Result<()
         Hit::Revert => state.revert(),
         Hit::Save => {
             state.name_mode = Some(NameAction::Save);
+            // An automatic layout suggests its screens as the name.
             state.name_text = state
                 .selected_profile
                 .and_then(|index| state.status.profiles.get(index))
                 .map(|profile| profile.name.clone())
+                .or_else(|| state.automatic_layout().map(str::to_string))
                 .unwrap_or_default();
             state.focus = Some(Hit::NameField);
             Ok(())
@@ -6004,6 +6199,7 @@ fn activate(app: &mut App, state: &mut State, ui: &Ui, action: Hit) -> Result<()
             Ok(())
         }
         Hit::Startup => state.toggle_startup(),
+        Hit::Automatic => state.toggle_automatic(),
         Hit::Reload => {
             state.request_reload(true);
             Ok(())
@@ -6167,6 +6363,7 @@ mod tests {
             profiles.push(backend::Profile {
                 name: format!("p{index}"),
                 outputs: Vec::new(),
+                ..Default::default()
             });
         }
         state.status.profiles = profiles;
@@ -6350,8 +6547,10 @@ mod tests {
                     position: backend::position_string(index as i32 * 1920, 0),
                     rotation: "normal".into(),
                     primary: index == 0,
+                    label: None,
                 })
                 .collect(),
+            ..Default::default()
         }
     }
 
@@ -6532,6 +6731,7 @@ mod tests {
         rects.extend(ui.profiles.actions);
         rects.extend(ui.profiles.prev);
         rects.extend(ui.profiles.next);
+        rects.extend(ui.profiles.automatic);
         rects
     }
 
@@ -6546,6 +6746,8 @@ mod tests {
         state.status.profiles = (0..11)
             .map(|i| profile(&format!("p{i}"), &["o0"]))
             .collect();
+        // niructl 0.17 reports automatic switching: the header has a toggle.
+        state.status.automatic = Some(backend::Automatic::default());
         for (w, h) in [(560, 420), (700, 560), (899, 699), (1400, 600), (560, 900)] {
             let l = layout(w, h);
             assert!(!l.too_small, "{w}x{h}");
@@ -6647,8 +6849,10 @@ mod tests {
                     position: backend::position_string(index as i32 * 2560, 0),
                     rotation: "normal".into(),
                     primary: index == 0,
+                    label: None,
                 })
                 .collect(),
+            ..Default::default()
         };
         let info = profile_info(&status, &desk);
         assert_eq!(info.missing, vec!["DisplayPort-7", "DisplayPort-8"]);
@@ -6913,5 +7117,143 @@ mod tests {
             next_second(now + Duration::from_secs(3), now),
             now + Duration::from_secs(1)
         );
+    }
+
+    fn automatic_status(enabled: bool, last_profile: Option<&str>) -> backend::Automatic {
+        backend::Automatic {
+            enabled,
+            last: last_profile.map(|name| backend::AutoEvent {
+                time: 1,
+                action: "profile".into(),
+                profile: Some(name.into()),
+                detail: String::new(),
+                ok: true,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rows_show_auto_manual_and_niructls_reason() {
+        let mut status = backend::Status {
+            outputs: vec![connected("eDP-1"), connected("DisplayPort-1")],
+            ..Default::default()
+        };
+        status.outputs[0].current = Some(backend::CurrentOutput {
+            mode: "1920x1080".into(),
+            rate: Some(60.0),
+            position: "0x0".into(),
+            rotation: "normal".into(),
+            primary: true,
+        });
+        status.outputs[1].active = false;
+        status.automatic = Some(automatic_status(true, Some("Laptop")));
+        let laptop = profile("Laptop", &["eDP-1"]);
+        let info = profile_info(&status, &laptop);
+        assert!(info.current && info.auto_applied && !info.manual_only);
+        // The same profile applied by hand is current but not "auto".
+        status.automatic = Some(automatic_status(true, Some("Other")));
+        assert!(!profile_info(&status, &laptop).auto_applied);
+        // Automation off: never "auto".
+        status.automatic = Some(automatic_status(false, Some("Laptop")));
+        assert!(!profile_info(&status, &laptop).auto_applied);
+        // niructl's verdict wins over connector names: the connector exists,
+        // but the screen with the saved identity is not there.
+        let mut desk = profile("Desk", &["DisplayPort-1"]);
+        desk.fit = Some("missing".into());
+        desk.loadable = Some(false);
+        desk.reason = Some("needs HPN HP E27q G5 (serial …2MRJ)".into());
+        desk.auto = false;
+        let info = profile_info(&status, &desk);
+        assert_eq!(
+            info.missing,
+            vec!["needs HPN HP E27q G5 (serial …2MRJ)".to_string()]
+        );
+        assert!(info.manual_only);
+        assert_eq!(
+            missing_outputs(&status, &desk),
+            vec!["HPN HP E27q G5 (serial …2MRJ)".to_string()]
+        );
+        // Hidden by the closed lid: not usable now, but it can be loaded.
+        let mut lid = profile("Lid", &["eDP-1"]);
+        lid.fit = Some("missing".into());
+        lid.loadable = Some(true);
+        lid.reason = Some("needs the built-in screen (the lid is closed)".into());
+        let info = profile_info(&status, &lid);
+        assert_eq!(info.missing.len(), 1);
+        assert!(missing_outputs(&status, &lid).is_empty());
+    }
+
+    #[test]
+    fn an_automatic_layout_is_offered_for_saving_until_it_is_a_profile() {
+        let mut state = state_with(vec![output("eDP-1", 0, 0, "1920x1080")]);
+        assert_eq!(
+            state.automatic_layout(),
+            None,
+            "an older niructl offers nothing"
+        );
+        assert!(state.toggle_automatic().is_err());
+        state.status.automatic = Some(backend::Automatic {
+            enabled: true,
+            automatic_layout: Some("built-in screen + HP E27q G5".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            state.automatic_layout(),
+            Some("built-in screen + HP E27q G5")
+        );
+        state.dirty = true;
+        assert_eq!(
+            state.automatic_layout(),
+            None,
+            "an edited draft is the user's own"
+        );
+        state.dirty = false;
+        state.status.automatic.as_mut().unwrap().current_profile = Some("Desk".into());
+        assert_eq!(
+            state.automatic_layout(),
+            None,
+            "a profile is shown, nothing to save"
+        );
+        // The toggle asks niructl to turn the automation off.
+        state.toggle_automatic().unwrap();
+        let (job, after) = state.outbox.pop().unwrap();
+        assert_eq!(job, backend::Job::Automatic { enabled: false });
+        assert!(matches!(after, After::Automatic { enabled: false }));
+        assert!(state.busy);
+    }
+
+    #[test]
+    fn the_automatic_toggle_sits_in_the_header_clear_of_the_title_and_pager() {
+        let mut state = state_with(vec![output("eDP-1", 0, 0, "1920x1080")]);
+        state.status.automatic = Some(backend::Automatic::default());
+        for profiles in [1usize, 30] {
+            state.status.profiles = (0..profiles)
+                .map(|i| profile(&format!("p{i}"), &["eDP-1"]))
+                .collect();
+            for (w, h) in [(560u16, 420u16), (900, 700), (1400, 900)] {
+                let ui = Ui::new(&state, w, h, None, 1.0, (0.0, 0.0));
+                let toggle = ui.profiles.automatic.expect("toggle");
+                assert!(
+                    toggle.x >= ui.l.profiles.x + 78,
+                    "{w}x{h}: clear of the title"
+                );
+                assert!(contains(ui.l.profiles, toggle.x, toggle.y));
+                for rect in [ui.profiles.prev, ui.profiles.next].into_iter().flatten() {
+                    assert!(!rects_overlap(rect, toggle), "{w}x{h}: {rect:?} {toggle:?}");
+                }
+                for (_, row) in &ui.profiles.rows {
+                    assert!(!rects_overlap(*row, toggle));
+                }
+                if ui.l.viewport.is_none() {
+                    assert_eq!(
+                        hit(&state, &ui, toggle.x + 2, toggle.y + 2),
+                        Some(Hit::Automatic),
+                        "{w}x{h}"
+                    );
+                }
+                assert!(focus_order(&ui).contains(&Hit::Automatic));
+            }
+        }
     }
 }

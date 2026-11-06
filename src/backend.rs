@@ -82,6 +82,9 @@ pub struct OutputState {
     pub current: Option<CurrentOutput>,
     #[serde(default)]
     pub modes: Vec<DisplayMode>,
+    /// The built-in panel of a laptop (eDP, LVDS, DSI).
+    #[serde(default)]
+    pub internal: bool,
 }
 
 impl OutputState {
@@ -104,6 +107,11 @@ pub struct ProfileOutput {
     pub rotation: String,
     #[serde(default)]
     pub primary: bool,
+    /// niructl's description of the screen the entry wants ("HPN HP E27q G5
+    /// (serial …2MRJ)", or the connector for profiles without identities).
+    /// Display only; never sent back.
+    #[serde(default, skip_serializing)]
+    pub label: Option<String>,
 }
 
 impl ProfileOutput {
@@ -112,12 +120,79 @@ impl ProfileOutput {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub outputs: Vec<ProfileOutput>,
+    /// Takes part in automatic switching (niructl `auto`, default true).
+    #[serde(default = "yes", skip_serializing)]
+    pub auto: bool,
+    /// How the profile fits the screens connected now: `exact`, `partial` or
+    /// `missing`. None from an older niructl.
+    #[serde(default, skip_serializing)]
+    pub fit: Option<String>,
+    /// Why it does not fit, e.g. "needs HPN HP E27q G5 (serial …2MRJ)".
+    #[serde(default, skip_serializing)]
+    pub reason: Option<String>,
+    /// Every screen it names is connected, so it can be loaded. None from
+    /// an older niructl.
+    #[serde(default, skip_serializing)]
+    pub loadable: Option<bool>,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            outputs: Vec::new(),
+            auto: true,
+            fit: None,
+            reason: None,
+            loadable: None,
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// What the automation did last.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AutoEvent {
+    #[serde(default)]
+    pub time: u64,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub ok: bool,
+}
+
+/// Automatic switching, as niructl reports it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Automatic {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub lid: Option<String>,
+    #[serde(default)]
+    pub last: Option<AutoEvent>,
+    #[serde(default)]
+    pub retry_in: Option<u64>,
+    #[serde(default)]
+    pub ambiguous: Vec<String>,
+    /// Set while the screens show a layout the automation made (remembered
+    /// or extended) rather than a saved profile.
+    #[serde(default)]
+    pub automatic_layout: Option<String>,
+    #[serde(default)]
+    pub current_profile: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -142,6 +217,9 @@ pub struct Status {
     pub startup_profile: Option<String>,
     #[serde(default)]
     pub preview: Option<Preview>,
+    /// None from an older niructl, which has no automatic switching.
+    #[serde(default)]
+    pub automatic: Option<Automatic>,
 }
 
 impl Status {
@@ -417,6 +495,16 @@ pub fn rename_profile(old: &str, new: &str) -> Result<(), String> {
     run(&["display", "rename", old, new], QUICK_DEADLINE).map(|_| ())
 }
 
+/// Turning it on acts on the connected screens at once, so it may apply a
+/// layout: it gets the apply deadline.
+pub fn set_automatic(enabled: bool) -> Result<(), String> {
+    run(
+        &["display", "automatic", if enabled { "on" } else { "off" }],
+        APPLY_DEADLINE,
+    )
+    .map(|_| ())
+}
+
 pub fn set_startup(name: Option<&str>) -> Result<(), String> {
     match name {
         Some(name) => run(&["display", "startup", "set", name], QUICK_DEADLINE).map(|_| ()),
@@ -451,6 +539,9 @@ pub enum Job {
     Startup {
         name: Option<String>,
     },
+    Automatic {
+        enabled: bool,
+    },
 }
 
 impl Job {
@@ -466,6 +557,7 @@ impl Job {
             Job::Rename { old, new } => rename_profile(old, new),
             Job::Delete { name } => delete_profile(name),
             Job::Startup { name } => set_startup(name.as_deref()),
+            Job::Automatic { enabled } => set_automatic(*enabled),
         };
         let status = read_status();
         if let Ok(status) = &status {

@@ -41,7 +41,13 @@ status() {
     read -r token expiry < "$FX/preview"
     preview="{\"name\":\"Draft\",\"token\":\"$token\",\"seconds_left\":$((expiry - now))}"
   fi
-  printf '],"startup_profile":%s,"preview":%s}\n' "$startup" "$preview"
+  automatic=null
+  if [ -f "$FX/auto" ]; then
+    enabled=false; [ "$(cat "$FX/auto")" = on ] && enabled=true
+    layout=null; [ -f "$FX/autolayout" ] && layout="\"$(cat "$FX/autolayout")\""
+    automatic="{\"enabled\":$enabled,\"lid\":null,\"last\":null,\"retry_in\":null,\"ambiguous\":[],\"automatic_layout\":$layout,\"current_profile\":null}"
+  fi
+  printf '],"startup_profile":%s,"preview":%s,"automatic":%s}\n' "$startup" "$preview" "$automatic"
 }
 case "$1 $2" in
 "display status") status ;;
@@ -60,6 +66,8 @@ case "$1 $2" in
   cat > "$FX/profiles/$3.json"; printf 'saved [%s]\n' "$3" >> "$FX/argv.log" ;;
 "display delete") rm -f "$FX/profiles/$3.json" ;;
 "display rename") mv "$FX/profiles/$3.json" "$FX/profiles/$4.json" ;;
+"display automatic")
+  printf '%s' "$3" > "$FX/auto"; printf 'automatic %s\n' "$3" >> "$FX/argv.log" ;;
 "display startup")
   if [ "$3" = set ]; then printf '%s' "$4" > "$FX/startup"; else rm -f "$FX/startup"; fi ;;
 *) echo "fixture: $*" >&2; exit 2 ;;
@@ -149,7 +157,10 @@ impl Session {
 }
 
 fn start() -> Session {
-    let root = std::env::temp_dir().join(format!("ndx-xvfb-{}", std::process::id()));
+    // One directory per test: the tests may run in parallel in one process.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let root = std::env::temp_dir().join(format!("ndx-xvfb-{}-{n}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     for dir in [
         "profiles",
@@ -442,4 +453,51 @@ fn events_typing_preview_and_close_under_xvfb() {
         );
         sleep(Duration::from_millis(25));
     }
+}
+
+#[test]
+#[ignore = "needs Xvfb, xdotool, xwd, xrandr and setxkbmap; CI runs it with --ignored"]
+fn automatic_switching_toggle_and_saving_an_automatic_layout_under_xvfb() {
+    let mut s = start();
+    // niructl 0.17: automatic switching is off, and the screens show a
+    // layout the automation made rather than a saved profile.
+    fs::write(s.root.join("auto"), "off").unwrap();
+    fs::write(s.root.join("autolayout"), "Left + Right").unwrap();
+    s.run("setxkbmap", &["us"]);
+    open_window(&mut s);
+    s.wait_log(Duration::from_secs(10), "the first status read", |l| {
+        l.iter().any(|x| x == "display status --json")
+    });
+    sleep(Duration::from_secs(1));
+    // From no focus, Shift+Tab walks back through Reload, Use at login,
+    // Delete, Rename and Save as… to the toggle; Space turns it on.
+    s.key(&["shift+Tab"; 6]);
+    s.key(&["space"]);
+    s.wait_log(Duration::from_secs(5), "automatic on", |l| {
+        l.iter().any(|x| x == "display automatic on")
+    });
+    assert_eq!(fs::read_to_string(s.root.join("auto")).unwrap(), "on");
+    sleep(Duration::from_millis(800));
+    // Ctrl+S offers the automatic layout under the name of its screens.
+    s.key(&["ctrl+s", "Return"]);
+    s.wait_log(Duration::from_secs(5), "the automatic layout saved", |l| {
+        l.iter().any(|x| x == "saved [Left + Right]")
+    });
+    let saved = fs::read_to_string(s.root.join("profiles/Left + Right.json")).unwrap();
+    assert!(
+        saved.contains("\"DP-1\"") && saved.contains("\"DP-2\""),
+        "{saved}"
+    );
+    assert!(
+        !saved.contains("label"),
+        "display-only fields are not saved: {saved}"
+    );
+    sleep(Duration::from_millis(800));
+    // The toggle turns it off again.
+    s.key(&["shift+Tab"; 6]);
+    s.key(&["space"]);
+    s.wait_log(Duration::from_secs(5), "automatic off", |l| {
+        l.iter().any(|x| x == "display automatic off")
+    });
+    assert!(!s.exited());
 }

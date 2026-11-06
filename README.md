@@ -55,8 +55,27 @@ no xrandr parser and no rollback daemon.
 - The window works down to 560x420: below 900x700 a compact layout stacks or
   scrolls the canvas, the panel and the profiles; below 560x420 it asks to be
   made larger.
-- Opt in to a profile at the next login; nothing is applied automatically by
-  default.
+- Opt in to a profile at the next login.
+- **Automatic switching** (needs `niructl` from NIRUWM 0.17). The *Automatic*
+  switch in the profile header turns it on or off; it is off by default.
+  - **What it does.** With it on, the session applies the right layout when
+    screens are plugged in or out or the laptop lid closes: a profile that
+    fits exactly, else the layout these screens had last time, else the
+    current layout with new screens to the right.
+  - **Badges.** The row of the profile the automation applied carries an
+    **auto** badge. A profile kept out of automatic switching
+    (`auto = false`) says **manual**.
+  - **Automatic layouts.** When the screens show a layout the automation
+    made rather than a saved profile, the header says *Automatic layout
+    (screens) — save as profile?* and *Save as…* is highlighted. It suggests
+    the screens as the name.
+  - **Header notes.** When several profiles fit equally well, the header
+    names them and asks you to pick one; the one you pick is used next time.
+    *Lid closed* and a running retry are noted there too.
+- Profiles follow their screens by identity (make, model and serial). A
+  profile that does not fit says why in its row: *needs HP E27q G5 (serial
+  …2MRJ)*, *needs the built-in screen (the lid is closed)* or *also
+  connected: HDMI-1*.
 
 The monitor arrangement is deliberately separate from NIRUWM's tiling layouts.
 The `layout` bar module still controls tile/monocle/floating, not which monitor
@@ -114,11 +133,26 @@ the problem and leaves the connected screens on the previous layout.
 
 ## Scope
 
-Resolution, refresh rate, position, rotation, primary, mirror/extend/single and
-profile management are in v1. Automatic dock/EDID profile switching, arbitrary
-modelines, fractional scaling, ICC calibration, DDC/CI, HDR/VRR and Wayland are
-future work. The window does not advertise controls the current X session cannot
-provide.
+In scope:
+
+- resolution, refresh rate, position, rotation and primary;
+- mirror, extend and single;
+- profile management;
+- profiles matched by screen identity;
+- automatic switching on hotplug and lid.
+
+The rules are in NIRUWM's
+[docs/display-profiles.md](https://github.com/nirucon/niruwm/blob/main/docs/display-profiles.md).
+
+Not offered:
+
+- arbitrary modelines;
+- fractional per-screen scaling (X11 has no sound way to do it);
+- ICC calibration, DDC/CI, HDR and VRR;
+- automatic rotation from a tilt sensor;
+- Wayland.
+
+The window does not advertise controls the current X session cannot provide.
 
 ## Build
 
@@ -142,6 +176,7 @@ The dependencies are already used across the suite: `x11rb`, `ab_glyph` and
 |---|---|
 | `~/.config/niruwm/displays.toml` | Profiles and the optional startup profile, owned by `niructl` |
 | `~/.local/state/niruwm/display-preview.toml` | Pending preview transaction, owned by `niructl` |
+| `~/.local/state/niruwm/display-memory.toml`, `display-auto.toml` | What the automatic switching remembers and did last, owned by `niructl` |
 | `NIRUDISPLAY_NIRUCTL` | Development override for a test `niructl` binary; when set, no other `niructl` is used |
 
 MIT. Copyright 2026 Nicklas Rudolfsson.
