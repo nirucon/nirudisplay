@@ -1,85 +1,84 @@
 # NIRU Display
 
-**Part of [NIRUX - a minimal X11 desktop by Nicklas Rudolfsson](https://github.com/nirucon/nirux).**
+Graphical monitor layout editor with safe previews and profiles for the NIRUX X11 desktop.
 
-A lightweight graphical monitor editor for the NIRUX desktop. It edits a draft,
-shows the screens as they are arranged, and sends every change through the same
-`niructl display` transaction as the CLI and launcher. It owns no profile store,
-no xrandr parser and no rollback daemon.
+**Status: beta** · Part of the [NIRUX](https://github.com/nirucon/nirux) suite · [MIT License](LICENSE)
 
-## What it does
+![NIRU Display](docs/screenshots/main.png)
 
-- Drag screens to move them. A frozen canvas, a dead zone and pixel-based edge
-  snapping keep the screen under the pointer while dragging. The exact position
-  is shown next to the screen and snap guides show shared edges. Arrow keys move
-  the selected screen by 1 px, or 10 px with Shift.
-- Every screen has a stable number, a full frame and a distinct fill. The number
-  is the same in the canvas, the screen list and Identify. Connector, EDID
-  manufacturer/model and a serial suffix make identical monitors distinguishable.
-- A selected screen has its own ring; the primary screen has a separate `P`
-  badge. Disabled outputs stay visible with a dashed frame. Partial overlaps and
-  invalid layouts are drawn in the warning colour and block Preview until fixed.
-- Enable or disable outputs, choose the primary screen, resolution, refresh rate
-  and rotation, or use the Single, Extend and Mirror layout actions. The mode,
-  rate and rotation buttons open a list: modes sorted by size with the
-  preferred mode marked and the current one checked, the rates of the chosen
-  mode, and the four rotations. With a single enabled screen that screen is
-  the primary one. Disabled
-  outputs do not shift the active desktop origin, and unknown modes block Preview. Mirroring
-  moves and edits the mirrored screens as one group.
-- Identify every active screen with its number, connector and model for four
-  seconds. Mirrored outputs are listed together on the physical screen.
-- Save, load, rename, update and delete profiles. Saving keeps the edited draft
-  and shows that it is saved but not applied; it never replaces the arrangement
-  with the running layout. "Save as…" under the loaded profile's own name
-  updates it; under another existing name it asks "Replace profile ‹name›?"
-  first. Names take every character the keyboard layout types (Shift, AltGr,
-  Å/Ä/Ö, the literal accent of a dead key). Renaming or deleting a startup
-  profile updates its startup reference. Delete asks for confirmation.
-- The profile list shows, per profile, a summary such as
-  "3 screens · eDP + 2× 2560x1440", a **current** badge on the profile that
-  matches the running layout and an **at login** badge on the startup profile.
-  Profiles that need a screen that is not connected are dimmed and say what
-  they need; they can still be renamed, deleted or used at login. Click loads
-  a profile, a double-click loads and previews it. Screens and profiles are
-  paged with the `<`/`>` buttons or the mouse wheel, so every entry stays
-  reachable.
-- Zoom with the mouse wheel over the canvas, pan with the middle mouse button,
-  and press `0` to fit the layout again.
-- Preview a layout for 15 seconds, keep it or revert, with a large countdown
-  and a bar. A separate watchdog keeps the countdown working even if the window
-  crashes or is killed. A preview token is adopted again when the window is
-  reopened, so Keep and Revert keep working.
-- Buttons, screens and profile rows show a hover state, and a disabled control
-  says why when it is hovered or focused ("Keep is available during a preview").
-- The window works down to 560x420: below 900x700 a compact layout stacks or
-  scrolls the canvas, the panel and the profiles; below 560x420 it asks to be
-  made larger.
-- Opt in to a profile at the next login.
-- **Automatic switching** (needs `niructl` from NIRUWM 0.17). The *Automatic*
-  switch in the profile header turns it on or off; it is off by default.
-  - **What it does.** With it on, the session applies the right layout when
-    screens are plugged in or out or the laptop lid closes: a profile that
-    fits exactly, else the layout these screens had last time, else the
-    current layout with new screens to the right.
-  - **Badges.** The row of the profile the automation applied carries an
-    **auto** badge. A profile kept out of automatic switching
-    (`auto = false`) says **manual**.
-  - **Automatic layouts.** When the screens show a layout the automation
-    made rather than a saved profile, the header says *Automatic layout
-    (screens) — save as profile?* and *Save as…* is highlighted. It suggests
-    the screens as the name.
-  - **Header notes.** When several profiles fit equally well, the header
-    names them and asks you to pick one; the one you pick is used next time.
-    *Lid closed* and a running retry are noted there too.
-- Profiles follow their screens by identity (make, model and serial). A
-  profile that does not fit says why in its row: *needs HP E27q G5 (serial
-  …2MRJ)*, *needs the built-in screen (the lid is closed)* or *also
-  connected: HDMI-1*.
+## About
 
-The monitor arrangement is deliberately separate from NIRUWM's tiling layouts.
-The `layout` bar module still controls tile/monocle/floating, not which monitor
-is where.
+NIRU Display (`nirudisplay`) is a lightweight graphical monitor editor. It edits
+a draft, shows the screens as they are arranged, and sends every change through
+the same `niructl display` transaction as the CLI and NIRU Launcher. It owns no
+profile store, no xrandr parser and no rollback daemon: NIRUWM's `niructl` does
+the work, so the window can never disagree with the session.
+
+The monitor arrangement is deliberately separate from NIRUWM's tiling layouts;
+the bar's `layout` module still controls tile/monocle/floating, not which
+monitor is where.
+
+In scope: resolution, refresh rate, position, rotation and primary; mirror,
+extend and single; profiles matched by screen identity; automatic switching on
+hotplug and lid. Not offered: arbitrary modelines, fractional per-screen scaling
+(X11 has no sound way to do it), ICC calibration, DDC/CI, HDR and VRR, automatic
+rotation from a tilt sensor, and Wayland. The window does not advertise controls
+the current X session cannot provide.
+
+## Features
+
+- Drag screens to move them, with a frozen canvas, a dead zone and edge
+  snapping; arrow keys move by 1 px (10 px with `Shift`).
+- Stable screen numbers shared by the canvas, the list and Identify; connector,
+  EDID manufacturer/model and a serial suffix tell identical monitors apart.
+- Enable or disable outputs, primary screen, resolution, refresh rate and
+  rotation, plus Single, Extend and Mirror layout actions. Invalid layouts are
+  drawn in the warning colour and block Preview.
+- Identify every active screen with its number, connector and model.
+- **Safe preview:** a layout is applied for 15 seconds with a large countdown;
+  Keep confirms it, Revert or the timeout restores the previous layout. The
+  timeout runs in a separate `niructl` process, so a crash of the window cannot
+  leave a risky layout in place.
+- Profiles: save, load, rename, update and delete, with summaries, **current**,
+  **at login**, **auto** and **manual** badges, and a reason when a profile
+  does not fit the connected screens.
+- Opt-in startup profile, applied once by `niruwm-session` at login.
+- **Automatic switching** on hotplug and lid close (off by default): a profile
+  that fits exactly, else the layout these screens had last time, else the
+  current layout with new screens to the right. Profiles follow their screens
+  by identity (make, model and serial).
+- Zoom with the wheel, pan with the middle button, `0` to fit.
+- Works down to 560×420 with a compact layout below 900×700.
+- Event-driven: RandR and inotify events, no polling; an idle window starts no
+  process.
+
+The full description of the editor, preview and profile behaviour and the event
+model is in [docs/EDITOR.md](docs/EDITOR.md).
+
+## Requirements
+
+- X11 with RandR and a NIRUX session: `niructl` from NIRUWM (automatic switching
+  needs NIRUWM 0.17 or newer).
+- Debian, Arch and Void glibc, x86_64. No GTK, Qt, Electron or WebView runtime.
+
+## Installation
+
+### With NIRUX
+
+NIRU Display is a core component: `nirux install` and `nirux update` install and
+update it from the pinned manifest, with its desktop entry and icon. Open it
+from NIRU Launcher or run `nirudisplay`.
+
+### Standalone
+
+For development, after `cargo build --release`:
+
+```sh
+./install.sh    # installs to ~/.local (NIRUDISPLAY_PREFIX or NIRUX_PREFIX override)
+```
+
+It installs `bin/nirudisplay`, the desktop entry and the icon. It still needs
+NIRUWM's `niructl` at run time.
 
 ## Usage
 
@@ -87,74 +86,69 @@ is where.
 nirudisplay              # open the window
 nirudisplay status       # connected screens and saved profiles
 nirudisplay list         # saved profiles
-nirudisplay --version | --help
+nirudisplay --version
+nirudisplay --help
 ```
 
-Keyboard: `Tab` moves focus, arrows move the selected screen (`Shift` for 10 px)
-when no property control is focused, `Space`/`Enter` activates the focused
-control, `I` identifies screens, `R` reloads the actual state (an edited draft
-stays one `Ctrl+Z` away), `Ctrl+Z` undoes a draft change, `Ctrl+S` opens
-"Save as…", `0` fits the canvas, `F1` shows help and `Esc`/`Q` closes. `Enter`
-on the mode, rate or rotation button opens its list (arrows move, `Enter`
-chooses, `Esc` closes); left/right on those buttons step through the values.
-While a preview started from this window runs, `Enter` keeps it and `Esc`
-reverts it.
+| Key | Action |
+|---|---|
+| `Tab` | Move focus |
+| Arrows (`Shift` for 10 px) | Move the selected screen when no property control is focused |
+| `Space` / `Enter` | Activate the focused control |
+| `Enter` on mode, rate or rotation | Open its list (arrows move, `Enter` chooses, `Esc` closes); left/right step through values |
+| `I` | Identify screens |
+| `R` | Reload the actual state (an edited draft stays one `Ctrl+Z` away) |
+| `Ctrl+Z` | Undo a draft change |
+| `Ctrl+S` | Save as… |
+| `0` | Fit the canvas |
+| `F1` | Help |
+| `Esc` / `Q` | Close |
+| During a preview: `Enter` / `Esc` | Keep / Revert |
 
-## Preview and profiles
+Closing the window during a preview asks **Keep layout**, **Revert** or Cancel;
+closing never reverts silently. Closing with unsaved changes asks first.
 
-`Preview` applies the draft with a visible countdown. `Keep` confirms it;
-`Revert` or the timeout restores the previous layout. The timeout runs in a
-separate `niructl` process, so a crash or kill of the window does not leave a
-risky layout in place. Closing the window during a preview asks: **Keep
-layout**, **Revert** or Cancel; closing never reverts silently. If the preview
-expires while the draft has unsaved changes, the draft is kept and the status
-line says so. Closing with unsaved changes asks first.
+## Configuration
 
-Every `niructl` call runs on one worker thread, one at a time, with a deadline
-(20 s for preview, keep and revert, 5 s otherwise), so the window keeps
-painting while a layout is applied; meanwhile only `Esc` is accepted, and it
-closes the window.
-
-## Events instead of polling
-
-The window does not poll. It listens for RandR screen, output, CRTC and
-property events on the root window, debounces them by 300 ms and reads
-`niructl display status --json` only when the RandR configuration actually
-changed, so the reprobe that `xrandr --query` inside niructl causes cannot
-start another read. inotify on `~/.config/niruwm` and `~/.local/state/niruwm`
-notices profiles and previews changed elsewhere and theme changes. During a
-preview the countdown runs from a local deadline; the status is read again
-every 5 s and just after the deadline, to see a Keep or Revert made elsewhere.
-An idle open window starts no process.
-
-`Use at login` stores an opt-in startup profile. `niruwm-session` applies it once
-before the window manager starts. If a saved output is missing, the session logs
-the problem and leaves the connected screens on the previous layout.
-
-## Scope
-
-In scope:
-
-- resolution, refresh rate, position, rotation and primary;
-- mirror, extend and single;
-- profile management;
-- profiles matched by screen identity;
-- automatic switching on hotplug and lid.
-
-The rules are in NIRUWM's
+Profiles, the startup profile and the automatic-switching state are owned by
+`niructl` and stored in NIRUWM's files (below). The rules for profiles and
+automatic switching are in NIRUWM's
 [docs/display-profiles.md](https://github.com/nirucon/niruwm/blob/main/docs/display-profiles.md).
+The *Automatic* switch in the profile header turns automatic switching on or
+off; a profile with `auto = false` is kept out of it.
 
-Not offered:
+`NIRUDISPLAY_NIRUCTL=/path/to/niructl` is a development override: when set, no
+other `niructl` is used.
 
-- arbitrary modelines;
-- fractional per-screen scaling (X11 has no sound way to do it);
-- ICC calibration, DDC/CI, HDR and VRR;
-- automatic rotation from a tilt sensor;
-- Wayland.
+## Files and paths
 
-The window does not advertise controls the current X session cannot provide.
+| Path | Purpose |
+|---|---|
+| `~/.config/niruwm/displays.toml` | Profiles and the optional startup profile, owned by `niructl` |
+| `~/.local/state/niruwm/display-preview.toml` | Pending preview transaction, owned by `niructl` |
+| `~/.local/state/niruwm/display-memory.toml`, `display-auto.toml` | What automatic switching remembers and did last, owned by `niructl` |
 
-## Build
+## Troubleshooting
+
+- **A layout went wrong:** do nothing; the preview reverts after 15 seconds,
+  even if the window crashed.
+- **A profile is dimmed:** it needs a screen that is not connected; its row
+  says which one (for example *needs the built-in screen (the lid is
+  closed)*).
+- **Several profiles fit:** the header names them and asks you to pick one; the
+  one you pick is used next time.
+- **A saved login profile did not apply:** `niruwm-session` logs the missing
+  output and leaves the connected screens on the previous layout.
+
+## Uninstall
+
+NIRU Display is removed with the suite by `nirux uninstall`. A standalone copy:
+delete `~/.local/bin/nirudisplay`,
+`~/.local/share/applications/nirudisplay.desktop` and
+`~/.local/share/icons/hicolor/256x256/apps/nirudisplay.png`. Profiles belong to
+NIRUWM and stay.
+
+## Building from source
 
 ```sh
 cargo build --release --locked
@@ -164,19 +158,40 @@ cargo test --locked --test xvfb -- --ignored   # needs Xvfb, xdotool, xwd, xrand
 ```
 
 The Xvfb test drives the window against a fixture `niructl` that records its
-arguments and input; it never touches a real display or profile. CI also
-builds and tests with Rust 1.85, the declared `rust-version`.
+arguments and input; it never touches a real display or profile. CI also builds
+and tests with Rust 1.85, the declared `rust-version`. Dependencies are already
+used across the suite: `x11rb`, `ab_glyph` and `serde_json`.
 
-The dependencies are already used across the suite: `x11rb`, `ab_glyph` and
-`serde_json`. There is no GTK, Qt, Electron or WebView runtime requirement.
+## Status, disclaimer and how it's made
 
-## Files
+**Status: beta.** I use it on every machine with more than one screen; automatic
+switching is the newest part and is off by default.
 
-| Path | Purpose |
+NIRUX and every niru* project are made by me, Nicklas Rudolfsson
+([@nirucon](https://github.com/nirucon)), for me. They are tailored to my own
+needs, preferences and workflows, on my own machines. If they fit yours too,
+that's a nice bonus.
+
+- **Free and open source.** Anyone is free to use, study, change and share
+  it under the [MIT License](LICENSE).
+- **No guarantees.** There is no warranty of any kind. Use it at your own
+  risk, read what you install and keep backups of anything that matters.
+- **How it's made.** Some of these projects I built from scratch by hand. In
+  more recent releases I have used Claude, Anthropic's AI, to do much of the
+  heavy lifting under my direction: I decide what to build and how it should
+  behave, and I test it on my own machines. It saves me a lot of time, and
+  the result is quite OK.
+- **Alpha, beta, dev, and maybe forever.** Most things here are alpha, beta
+  or dev, and may stay that way. Maybe one day there will be a real stable
+  release, but given how fast development moves, and how I am as a person,
+  maybe never :)
+
+| Label | Meaning |
 |---|---|
-| `~/.config/niruwm/displays.toml` | Profiles and the optional startup profile, owned by `niructl` |
-| `~/.local/state/niruwm/display-preview.toml` | Pending preview transaction, owned by `niructl` |
-| `~/.local/state/niruwm/display-memory.toml`, `display-auto.toml` | What the automatic switching remembers and did last, owned by `niructl` |
-| `NIRUDISPLAY_NIRUCTL` | Development override for a test `niructl` binary; when set, no other `niructl` is used |
+| dev | Under active construction; may not build, install or work yet. |
+| alpha | Works on my machines, but incomplete or rough; expect breaking changes. |
+| beta | In daily use on my machines and mostly complete; rough edges remain. |
 
-MIT. Copyright 2026 Nicklas Rudolfsson.
+## License
+
+MIT License, see [LICENSE](LICENSE). Copyright (c) 2026 Nicklas Rudolfsson.
