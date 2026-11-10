@@ -92,9 +92,11 @@ nirudisplay --help
 
 | Key | Action |
 |---|---|
-| `Tab` | Move focus |
+| `Tab` / `Shift+Tab` | Move focus (`Esc` clears it) |
 | Arrows (`Shift` for 10 px) | Move the selected screen when no property control is focused |
 | `Space` / `Enter` | Activate the focused control |
+| `Enter` with nothing focused | Preview the draft |
+| `PageUp` / `PageDown` | Page through the screen list |
 | `Enter` on mode, rate or rotation | Open its list (arrows move, `Enter` chooses, `Esc` closes); left/right step through values |
 | `I` | Identify screens |
 | `R` | Reload the actual state (an edited draft stays one `Ctrl+Z` away) |
