@@ -5194,8 +5194,21 @@ fn load_cursors(c: &RustConnection) -> Option<Cursors> {
     c.open_font(font, b"cursor").ok()?.check().ok()?;
     let make = |glyph: u16| -> Option<Cursor> {
         let cursor = c.generate_id().ok()?;
+        // Each shape in the cursor font is followed by its mask. With the
+        // shape as its own mask the white outline was lost and the pointer
+        // was a black arrow, hard to see on a dark theme.
         c.create_glyph_cursor(
-            cursor, font, font, glyph, glyph, 0, 0, 0, 0xffff, 0xffff, 0xffff,
+            cursor,
+            font,
+            font,
+            glyph,
+            cursor_mask(glyph),
+            0,
+            0,
+            0,
+            0xffff,
+            0xffff,
+            0xffff,
         )
         .ok()?
         .check()
@@ -5207,6 +5220,11 @@ fn load_cursors(c: &RustConnection) -> Option<Cursors> {
         fleur: make(52)?,
         hand: make(60)?,
     })
+}
+
+/// The mask glyph of a cursor font shape: the next one.
+fn cursor_mask(glyph: u16) -> u16 {
+    glyph + 1
 }
 
 /// Wait until the X socket, the worker's wake pipe or the file watcher has
@@ -6215,6 +6233,14 @@ fn activate(app: &mut App, state: &mut State, ui: &Ui, action: Hit) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointers_keep_their_white_outline() {
+        // left_ptr, fleur and hand2 with the masks that follow them.
+        assert_eq!(cursor_mask(68), 69);
+        assert_eq!(cursor_mask(52), 53);
+        assert_eq!(cursor_mask(60), 61);
+    }
 
     fn output(name: &str, x: i32, y: i32, mode: &str) -> DraftOutput {
         DraftOutput {
